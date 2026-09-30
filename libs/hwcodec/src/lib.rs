@@ -2,12 +2,14 @@
 pub mod capture;
 pub mod common;
 pub mod ffmpeg;
-#[cfg(all(
-    any(target_arch = "aarch64", target_arch = "arm", feature = "rkmpp"),
-    not(target_os = "android")
-))]
+#[cfg(any(target_arch = "aarch64", target_arch = "arm", feature = "rkmpp"))]
 pub mod ffmpeg_hw;
 pub mod ffmpeg_ram;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "arm", feature = "rkmpp")
+))]
+pub mod rkmpp_dmabuf;
 
 #[no_mangle]
 pub extern "C" fn hwcodec_log(level: i32, message: *const std::os::raw::c_char) {

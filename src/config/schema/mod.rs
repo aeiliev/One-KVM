@@ -8,14 +8,20 @@ mod atx;
 mod common;
 mod computer_use;
 mod hid;
+mod otg_network;
 mod stream;
+mod uac;
+mod watchdog;
 mod web;
 
 pub use atx::*;
 pub use common::*;
 pub use computer_use::*;
 pub use hid::*;
+pub use otg_network::*;
 pub use stream::*;
+pub use uac::*;
+pub use watchdog::*;
 pub use web::*;
 
 #[typeshare]
@@ -27,6 +33,7 @@ pub struct AppConfig {
     pub auth: AuthConfig,
     pub video: VideoConfig,
     pub hid: HidConfig,
+    pub otg_network: OtgNetworkConfig,
     pub msd: MsdConfig,
     pub atx: AtxConfig,
     pub audio: AudioConfig,
@@ -38,12 +45,19 @@ pub struct AppConfig {
     pub vnc: VncConfig,
     pub rtsp: RtspConfig,
     pub redfish: RedfishConfig,
+    pub watchdog: WatchdogConfig,
+    pub uac: UacConfig,
 }
 
 impl AppConfig {
     pub fn enforce_invariants(&mut self) {
         if self.hid.backend != HidBackend::Otg {
             self.msd.enabled = false;
+            self.otg_network.enabled = false;
+            self.uac.enabled = false;
+        }
+        if self.hid.backend == HidBackend::Bluetooth {
+            self.hid.mouse_absolute = false;
         }
         self.atx.normalize();
     }
@@ -51,5 +65,20 @@ impl AppConfig {
     pub fn apply_platform_defaults(&mut self) {
         crate::platform::defaults::apply(self);
         self.enforce_invariants();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_watchdog_config_defaults_to_disabled() {
+        let value = serde_json::to_value(AppConfig::default()).unwrap();
+        let mut object = value.as_object().unwrap().clone();
+        object.remove("watchdog");
+
+        let config: AppConfig = serde_json::from_value(object.into()).unwrap();
+        assert!(!config.watchdog.enabled);
     }
 }

@@ -17,13 +17,21 @@ fn default_ch9329_baud_rate() -> u32 {
 #[serde(tag = "type", rename_all = "lowercase")]
 #[derive(Default)]
 pub enum HidBackendType {
-    Otg,
+    Otg {
+        #[serde(default)]
+        macos_drag: bool,
+    },
+    Bluetooth {
+        config: crate::config::BluetoothHidConfig,
+    },
     Ch9329 {
         port: String,
         #[serde(default = "default_ch9329_baud_rate")]
         baud_rate: u32,
         #[serde(default)]
         hybrid_mouse: bool,
+        #[serde(default)]
+        macos_drag: bool,
     },
     #[default]
     None,
@@ -32,7 +40,8 @@ pub enum HidBackendType {
 impl HidBackendType {
     pub fn name_str(&self) -> &str {
         match self {
-            Self::Otg => "otg",
+            Self::Otg { .. } => "otg",
+            Self::Bluetooth { .. } => "bluetooth",
             Self::Ch9329 { .. } => "ch9329",
             Self::None => "none",
         }
@@ -81,7 +90,22 @@ pub trait HidBackend: Send + Sync {
         ))
     }
 
+    async fn bluetooth_status(&self) -> Result<serde_json::Value> {
+        Err(crate::error::AppError::BadRequest(
+            "Bluetooth HID is not active".into(),
+        ))
+    }
+    async fn bluetooth_action(&self, _action: &str, _seconds: u32) -> Result<()> {
+        Err(crate::error::AppError::BadRequest(
+            "Bluetooth HID is not active".into(),
+        ))
+    }
+
     async fn reset(&self) -> Result<()>;
+
+    async fn prepare_rebuild(&self) -> Result<()> {
+        self.shutdown().await
+    }
 
     async fn shutdown(&self) -> Result<()>;
 

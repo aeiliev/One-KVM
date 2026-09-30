@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { focusConsolePanel } from "@/composables/useConsoleAppearance"
 import { ref, computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { toast } from 'vue-sonner'
@@ -15,9 +16,8 @@ import {
   SelectContent,
   SelectItem,
   SelectTrigger,
-  SelectValue,
 } from '@/components/ui/select'
-import { Monitor, RefreshCw, Loader2, Settings, Zap, Scale, Image, AlertTriangle } from 'lucide-vue-next'
+import { Monitor, RefreshCw, Loader2, Zap, Scale, Image } from 'lucide-vue-next'
 import HelpTooltip from '@/components/HelpTooltip.vue'
 import {
   configApi,
@@ -26,44 +26,33 @@ import {
   type EncoderBackendInfo,
   type BitratePreset,
   type StreamConstraintsResponse,
+  type VideoDevice,
 } from '@/api'
 import { getVideoFormatState, isVideoFormatSelectable } from '@/lib/video-format-support'
-import { formatFpsLabel, toConfigFps } from '@/lib/fps'
+import { toConfigFps } from '@/lib/fps'
 import { formatVideoDeviceLabel } from '@/lib/video-device-label'
 import { useConfigStore } from '@/stores/config'
-import { useRouter } from 'vue-router'
+import { useVideoDeviceConfiguration } from '@/composables/useVideoDeviceConfiguration'
+import type { VideoRotation } from '@/composables/useVideoScaling'
+import VideoInputFields from '@/components/VideoInputFields.vue'
 
 export type VideoMode = 'mjpeg' | 'h264' | 'h265' | 'vp8' | 'vp9'
-
-interface VideoDevice {
-  path: string
-  name: string
-  driver: string
-  formats: {
-    format: string
-    description: string
-    resolutions: {
-      width: number
-      height: number
-      fps: number[]
-    }[]
-  }[]
-  has_signal?: boolean
-}
 
 const props = defineProps<{
   open: boolean
   videoMode: VideoMode
+  videoRotation: VideoRotation
+  side?: 'top' | 'right' | 'bottom' | 'left'
 }>()
 
 const emit = defineEmits<{
   (e: 'update:open', value: boolean): void
   (e: 'update:videoMode', value: VideoMode): void
+  (e: 'update:videoRotation', value: VideoRotation): void
 }>()
 
 const { t } = useI18n()
 const configStore = useConfigStore()
-const router = useRouter()
 
 // Device list
 const devices = ref<VideoDevice[]>([])
@@ -76,18 +65,9 @@ const loadingCodecs = ref(false)
 const backends = ref<EncoderBackendInfo[]>([])
 const constraints = ref<StreamConstraintsResponse | null>(null)
 const currentEncoderBackend = computed(() => configStore.stream?.encoder || 'auto')
-const isRtspEnabled = computed(() => {
-  if (typeof configStore.rtspStatus?.config?.enabled === 'boolean') {
-    return configStore.rtspStatus.config.enabled
-  }
-  return !!configStore.rtspConfig?.enabled
-})
-const isRustdeskEnabled = computed(() => {
-  if (typeof configStore.rustdeskStatus?.config?.enabled === 'boolean') {
-    return configStore.rustdeskStatus.config.enabled
-  }
-  return !!configStore.rustdeskConfig?.enabled
-})
+const isServiceActive = (status: string | undefined) => status === 'starting' || status === 'running'
+const isRtspEnabled = computed(() => isServiceActive(configStore.rtspStatus?.service_status))
+const isRustdeskEnabled = computed(() => isServiceActive(configStore.rustdeskStatus?.service_status))
 const isRtspCodecLocked = computed(() => isRtspEnabled.value)
 const isRustdeskWebrtcLocked = computed(() => !isRtspEnabled.value && isRustdeskEnabled.value)
 const codecLockSources = computed(() => {
@@ -189,55 +169,36 @@ const translateBackendName = (backend: string | undefined): string => {
   return backend
 }
 
-const hasHighFps = (format: { resolutions: { fps: number[] }[] }): boolean => {
-  return format.resolutions.some(res => res.fps.some(fps => fps >= 30))
-}
-
-const isFormatRecommended = (formatName: string): boolean => {
-  if (!isVideoFormatSelectable(formatName, props.videoMode, currentEncoderBackend.value)) {
-    return false
-  }
-
-  const formats = availableFormats.value
-  const upperFormat = formatName.toUpperCase()
-
-  // MJPEG/HTTP mode: recommend MJPEG
-  if (props.videoMode === 'mjpeg') {
-    return upperFormat === 'MJPEG'
-  }
-
-  // WebRTC mode: check NV12 first, then YUYV
-  const currentFormat = formats.find(f => f.format.toUpperCase() === upperFormat)
-  if (!currentFormat) return false
-
-  const nv12Format = formats.find(f => f.format.toUpperCase() === 'NV12')
-  const nv12HasHighFps = nv12Format && hasHighFps(nv12Format)
-
-  const yuyvFormat = formats.find(f => f.format.toUpperCase() === 'YUYV')
-  const yuyvHasHighFps = yuyvFormat && hasHighFps(yuyvFormat)
-
-  if (nv12HasHighFps) {
-    return upperFormat === 'NV12'
-  }
-
-  if (yuyvHasHighFps) {
-    return upperFormat === 'YUYV'
-  }
-
-  return false
-}
-
-// In WebRTC mode, compressed formats (MJPEG/JPEG) are not recommended
-const isFormatNotRecommended = (formatName: string): boolean => {
-  return getFormatState(formatName) === 'not_recommended'
-}
-
 const selectedDevice = ref<string>('')
 const selectedFormat = ref<string>('')
 const selectedResolution = ref<string>('')
-const selectedFps = ref<number>(30)
+const selectedFps = ref<number | null>(30)
 const selectedBitratePreset = ref<'Speed' | 'Balanced' | 'Quality'>('Balanced')
 const isDirty = ref(false)
+
+const videoConfiguration = useVideoDeviceConfiguration({
+  devices,
+  selection: {
+    device: selectedDevice,
+    format: selectedFormat,
+    resolution: selectedResolution,
+    fps: selectedFps,
+  },
+  active: computed(() => props.open),
+  listenForStreamEvents: true,
+  preferredFormat: device => device.formats.find(format =>
+    isVideoFormatSelectable(format.format, props.videoMode, currentEncoderBackend.value),
+  )?.format,
+})
+const {
+  selectedDevice: selectedDeviceInfo,
+  isSourceFollowing,
+  availableFormats,
+  availableResolutions,
+  availableFps,
+  refreshInputStatus,
+  refreshingInputStatus,
+} = videoConfiguration
 
 const applying = ref(false)
 const applyingBitrate = ref(false)
@@ -251,6 +212,7 @@ const currentConfig = computed(() => ({
 }))
 
 const buttonText = computed(() => t('actionbar.videoConfig'))
+const videoRotationOptions: VideoRotation[] = [0, 90, 180, 270]
 
 // Available codecs for selection (filtered by backend support and enriched with backend info)
 const availableCodecs = computed(() => {
@@ -292,34 +254,12 @@ const availableCodecs = computed(() => {
   return backendFiltered.filter(codec => allowed.includes(codec.id))
 })
 
-const availableFormats = computed(() => {
-  const device = devices.value.find(d => d.path === selectedDevice.value)
-  return device?.formats || []
-})
-
 const availableFormatOptions = computed(() => {
   return availableFormats.value.map(format => ({
     ...format,
     state: getFormatState(format.format),
     disabled: isFormatUnsupported(format.format),
   }))
-})
-
-const availableResolutions = computed(() => {
-  const format = availableFormats.value.find(f => f.format === selectedFormat.value)
-  return format?.resolutions || []
-})
-
-const availableFps = computed(() => {
-  const resolution = availableResolutions.value.find(
-    r => `${r.width}x${r.height}` === selectedResolution.value
-  )
-  return resolution?.fps || []
-})
-
-const selectedFormatInfo = computed(() => {
-  const format = availableFormatOptions.value.find(f => f.format === selectedFormat.value)
-  return format
 })
 
 const selectedCodecInfo = computed(() => {
@@ -365,10 +305,6 @@ async function loadConstraints() {
   } catch {
     constraints.value = null
   }
-}
-
-function goToSettings() {
-  router.push('/settings?tab=video')
 }
 
 function initializeFromCurrent() {
@@ -457,6 +393,10 @@ function handleDeviceChange(devicePath: unknown) {
   isDirty.value = true
 
   const device = devices.value.find(d => d.path === devicePath)
+  if (device?.control_mode === 'source_following') {
+    clearFormatSelection()
+    return
+  }
   const format = device ? findFirstSelectableFormat(device.formats) : undefined
   if (!format) {
     clearFormatSelection()
@@ -518,13 +458,15 @@ async function applyVideoConfig() {
 
   applying.value = true
   try {
-    await configStore.updateVideo({
-      device: selectedDevice.value,
-      format: selectedFormat.value,
-      width,
-      height,
-      fps: toConfigFps(selectedFps.value),
-    })
+    await configStore.updateVideo(isSourceFollowing.value
+      ? { device: selectedDevice.value }
+      : {
+          device: selectedDevice.value,
+          format: selectedFormat.value,
+          width,
+          height,
+          fps: toConfigFps(selectedFps.value ?? 30),
+        })
 
     isDirty.value = false
     // Stream state will be updated via WebSocket system.device_info event
@@ -602,12 +544,23 @@ watch(
 <template>
   <Popover :open="open" @update:open="emit('update:open', $event)">
     <PopoverTrigger as-child>
-      <Button variant="ghost" size="sm" class="h-7 w-7 sm:h-8 sm:w-auto p-0 sm:px-2 sm:gap-1.5 text-xs">
-        <Monitor class="h-3.5 w-3.5 sm:h-4 sm:w-4" />
+      <Button
+        variant="ghost"
+        size="sm"
+        class="size-8 sm:w-auto p-0 sm:px-2 sm:gap-1.5 text-xs"
+        :aria-label="buttonText"
+        :title="buttonText"
+      >
+        <Monitor class="size-3.5 sm:size-4" />
         <span class="hidden sm:inline">{{ buttonText }}</span>
       </Button>
     </PopoverTrigger>
-    <PopoverContent class="w-[min(320px,92vw)] p-3" align="start">
+    <PopoverContent
+      @open-auto-focus="focusConsolePanel"
+      class="console-config-panel w-[min(320px,92vw)] p-3"
+      align="start"
+      :side="props.side ?? 'bottom'"
+    >
       <div class="space-y-3">
         <h4 class="text-sm font-medium">{{ t('actionbar.videoConfig') }}</h4>
 
@@ -619,21 +572,24 @@ watch(
 
           <!-- Mode Selection -->
           <div class="space-y-2">
-            <Label class="text-xs">{{ t('actionbar.videoMode') }}</Label>
+            <div class="flex items-center gap-1">
+              <Label class="text-xs text-muted-foreground">{{ t('actionbar.videoMode') }}</Label>
+              <HelpTooltip :content="t('actionbar.videoModeHint')" icon-size="sm" side="right" />
+            </div>
             <Select
               :model-value="props.videoMode"
               @update:model-value="handleVideoModeChange"
               :disabled="loadingCodecs || availableCodecs.length === 0 || isRtspCodecLocked"
             >
-              <SelectTrigger class="h-8 text-xs">
+              <SelectTrigger size="sm" class="w-full text-xs">
                 <div v-if="selectedCodecInfo" class="flex items-center gap-1.5 truncate">
                   <span class="truncate">{{ selectedCodecInfo.name }}</span>
                   <span
                     v-if="selectedCodecInfo.backend && selectedCodecInfo.id !== 'mjpeg'"
                     class="text-[10px] px-1 py-0.5 rounded shrink-0"
                     :class="selectedCodecInfo.hardware
-                      ? 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300'
-                      : 'bg-orange-100 text-orange-700 dark:bg-orange-900 dark:text-orange-300'"
+                      ? 'bg-info/10 text-info'
+                      : 'bg-warning/10 text-warning'"
                   >
                     {{ translateBackendName(selectedCodecInfo.backend) }}
                   </span>
@@ -655,8 +611,8 @@ watch(
                       v-if="codec.backend && codec.id !== 'mjpeg'"
                       class="text-[10px] px-1.5 py-0.5 rounded"
                       :class="codec.hardware
-                        ? 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300'
-                        : 'bg-orange-100 text-orange-700 dark:bg-orange-900 dark:text-orange-300'"
+                        ? 'bg-info/10 text-info'
+                        : 'bg-warning/10 text-warning'"
                     >
                       {{ translateBackendName(codec.backend) }}
                     </span>
@@ -670,18 +626,36 @@ watch(
                 </SelectItem>
               </SelectContent>
             </Select>
-            <p v-if="props.videoMode !== 'mjpeg'" class="text-xs text-muted-foreground">
-              {{ t('actionbar.webrtcHint') }}
-            </p>
-            <p v-if="isCodecLocked" class="text-xs text-amber-600 dark:text-amber-400">
+            <p v-if="isCodecLocked" class="text-xs text-warning">
               {{ codecLockMessage }}
             </p>
+          </div>
+
+          <!-- Display Rotation -->
+          <div class="space-y-2">
+            <Label class="text-xs text-muted-foreground">{{ t('actionbar.videoRotation') }}</Label>
+            <div class="grid grid-cols-4 gap-1.5">
+              <Button
+                v-for="rotation in videoRotationOptions"
+                :key="rotation"
+                variant="outline"
+                size="sm"
+                :class="[
+                  'h-8 px-1 text-xs tabular-nums',
+                  props.videoRotation === rotation && 'border-primary bg-primary/10',
+                ]"
+                :aria-pressed="props.videoRotation === rotation"
+                @click="emit('update:videoRotation', rotation)"
+              >
+                {{ rotation }}°
+              </Button>
+            </div>
           </div>
 
           <!-- Bitrate Preset - Only shown for WebRTC modes -->
           <div v-if="props.videoMode !== 'mjpeg'" class="space-y-2">
             <div class="flex items-center gap-1">
-              <Label class="text-xs">{{ t('actionbar.bitratePreset') }}</Label>
+              <Label class="text-xs text-muted-foreground">{{ t('actionbar.bitratePreset') }}</Label>
               <HelpTooltip :content="t('help.videoBitratePreset')" icon-size="sm" />
             </div>
             <div class="grid grid-cols-3 gap-1.5">
@@ -695,7 +669,7 @@ watch(
                 :disabled="applyingBitrate"
                 @click="handleBitratePresetChange('Speed')"
               >
-                <Zap class="h-3.5 w-3.5" />
+                <Zap class="size-3.5" />
                 <span class="text-[10px] font-medium">{{ t('actionbar.bitrateSpeed') }}</span>
               </Button>
               <Button
@@ -708,7 +682,7 @@ watch(
                 :disabled="applyingBitrate"
                 @click="handleBitratePresetChange('Balanced')"
               >
-                <Scale class="h-3.5 w-3.5" />
+                <Scale class="size-3.5" />
                 <span class="text-[10px] font-medium">{{ t('actionbar.bitrateBalanced') }}</span>
               </Button>
               <Button
@@ -721,195 +695,90 @@ watch(
                 :disabled="applyingBitrate"
                 @click="handleBitratePresetChange('Quality')"
               >
-                <Image class="h-3.5 w-3.5" />
+                <Image class="size-3.5" />
                 <span class="text-[10px] font-medium">{{ t('actionbar.bitrateQuality') }}</span>
               </Button>
             </div>
           </div>
 
-          <Button
-            variant="ghost"
-            size="sm"
-            class="w-full h-7 text-xs text-muted-foreground hover:text-foreground justify-start px-0"
-            @click="goToSettings"
-          >
-            <Settings class="h-3.5 w-3.5 mr-1.5" />
-            {{ t('actionbar.changeEncoderBackend') }}
-          </Button>
         </div>
 
         <!-- Device Settings Section -->
         <Separator />
 
         <div class="space-y-3">
-          <div
-            v-if="videoParamWarningMessage"
-            class="rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-2"
-          >
-            <p class="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-300">
-              <AlertTriangle class="h-3.5 w-3.5 mt-0.5 shrink-0" />
-              <span>{{ videoParamWarningMessage }}</span>
-            </p>
-          </div>
+          <p v-if="videoParamWarningMessage" class="text-xs text-warning">
+            {{ videoParamWarningMessage }}
+          </p>
 
           <div class="flex items-center justify-between">
             <h5 class="text-xs font-medium text-muted-foreground">{{ t('actionbar.deviceSettings') }}</h5>
             <Button
               variant="ghost"
-              size="icon"
-              class="h-6 w-6"
+              size="icon-xs"
               :disabled="loadingDevices"
               @click="loadDevices"
             >
-              <RefreshCw :class="['h-3.5 w-3.5', loadingDevices && 'animate-spin']" />
+              <RefreshCw :class="['size-3.5', loadingDevices && 'animate-spin']" />
             </Button>
           </div>
 
           <!-- Device Selection -->
           <div class="space-y-2">
-            <Label class="text-xs">{{ t('actionbar.videoDevice') }}</Label>
+            <Label class="text-xs text-muted-foreground">{{ t('actionbar.videoDevice') }}</Label>
             <Select
               :model-value="selectedDevice"
               @update:model-value="handleDeviceChange"
               :disabled="loadingDevices || devices.length === 0"
             >
-              <SelectTrigger class="h-8 text-xs">
-                <SelectValue :placeholder="loadingDevices ? t('common.loading') : t('actionbar.selectDevice')" />
+              <SelectTrigger size="sm" class="w-full text-xs">
+                <span v-if="selectedDeviceInfo" class="min-w-0 truncate">
+                  {{ formatVideoDeviceLabel(selectedDeviceInfo) }}
+                </span>
+                <span v-else class="text-muted-foreground">
+                  {{ loadingDevices ? t('common.loading') : t('actionbar.selectDevice') }}
+                </span>
               </SelectTrigger>
-              <SelectContent>
+              <SelectContent class="max-w-[min(360px,calc(100vw-2rem))]">
                 <SelectItem
                   v-for="device in devices"
                   :key="device.path"
                   :value="device.path"
                   class="text-xs"
                 >
-                  {{ formatVideoDeviceLabel(device) }}
+                  <span class="block min-w-0 truncate" :title="formatVideoDeviceLabel(device)">
+                    {{ formatVideoDeviceLabel(device) }}
+                  </span>
                 </SelectItem>
               </SelectContent>
             </Select>
           </div>
 
-          <!-- Format Selection -->
-          <div class="space-y-2">
-            <Label class="text-xs">{{ t('actionbar.videoFormat') }}</Label>
-            <Select
-              :model-value="selectedFormat"
-              @update:model-value="handleFormatChange"
-              :disabled="!selectedDevice || availableFormats.length === 0"
-            >
-              <SelectTrigger class="h-8 text-xs">
-                <div v-if="selectedFormatInfo" class="flex items-center gap-1.5 truncate">
-                  <span class="truncate">{{ selectedFormatInfo.description }}</span>
-                  <span
-                    v-if="selectedFormatInfo.state === 'unsupported'"
-                    class="shrink-0 text-muted-foreground"
-                  >
-                    {{ t('common.notSupportedYet') }}
-                  </span>
-                  <span
-                    v-if="isFormatRecommended(selectedFormatInfo.format)"
-                    class="text-[10px] px-1 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300 shrink-0"
-                  >
-                    {{ t('actionbar.recommended') }}
-                  </span>
-                  <span
-                    v-else-if="isFormatNotRecommended(selectedFormatInfo.format)"
-                    class="text-[10px] px-1 py-0.5 rounded bg-orange-100 text-orange-700 dark:bg-orange-900 dark:text-orange-300 shrink-0"
-                  >
-                    {{ t('actionbar.notRecommended') }}
-                  </span>
-                </div>
-                <span v-else class="text-muted-foreground">{{ t('actionbar.selectFormat') }}</span>
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem
-                  v-for="format in availableFormatOptions"
-                  :key="format.format"
-                  :value="format.format"
-                  :disabled="format.disabled"
-                  :class="['text-xs', { 'opacity-50': format.disabled }]"
-                >
-                  <div class="flex items-center gap-2">
-                    <span>{{ format.description }}</span>
-                    <span
-                      v-if="format.state === 'unsupported'"
-                      class="text-muted-foreground"
-                    >
-                      {{ t('common.notSupportedYet') }}
-                    </span>
-                    <span
-                      v-if="isFormatRecommended(format.format)"
-                      class="text-[10px] px-1.5 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
-                    >
-                      {{ t('actionbar.recommended') }}
-                    </span>
-                    <span
-                      v-else-if="isFormatNotRecommended(format.format)"
-                      class="text-[10px] px-1.5 py-0.5 rounded bg-orange-100 text-orange-700 dark:bg-orange-900 dark:text-orange-300"
-                    >
-                      {{ t('actionbar.notRecommended') }}
-                    </span>
-                  </div>
-                </SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-
-          <!-- Resolution Selection -->
-          <div class="space-y-2">
-            <Label class="text-xs">{{ t('actionbar.videoResolution') }}</Label>
-            <Select
-              :model-value="selectedResolution"
-              @update:model-value="handleResolutionChange"
-              :disabled="!selectedFormat || availableResolutions.length === 0"
-            >
-              <SelectTrigger class="h-8 text-xs">
-                <SelectValue :placeholder="t('actionbar.selectResolution')" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem
-                  v-for="res in availableResolutions"
-                  :key="`${res.width}x${res.height}`"
-                  :value="`${res.width}x${res.height}`"
-                  class="text-xs"
-                >
-                  {{ res.width }} x {{ res.height }}
-                </SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-
-          <!-- FPS Selection -->
-          <div class="space-y-2">
-            <Label class="text-xs">{{ t('actionbar.videoFps') }}</Label>
-            <Select
-              :model-value="String(selectedFps)"
-              @update:model-value="handleFpsChange"
-              :disabled="!selectedResolution || availableFps.length === 0"
-            >
-              <SelectTrigger class="h-8 text-xs">
-                <SelectValue :placeholder="t('actionbar.selectFps')" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem
-                  v-for="fps in availableFps"
-                  :key="fps"
-                  :value="String(fps)"
-                  class="text-xs"
-                >
-                  {{ formatFpsLabel(fps) }}
-                </SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
+          <VideoInputFields
+            v-if="selectedDeviceInfo"
+            compact
+            :device="selectedDeviceInfo"
+            :formats="availableFormatOptions"
+            :resolutions="availableResolutions"
+            :fps-options="availableFps"
+            :format="selectedFormat"
+            :resolution="selectedResolution"
+            :fps="selectedFps"
+            :refreshing="refreshingInputStatus"
+            @update:format="handleFormatChange"
+            @update:resolution="handleResolutionChange"
+            @update:fps="handleFpsChange"
+            @refresh="refreshInputStatus"
+          />
 
           <!-- Apply Button -->
           <Button
-            class="w-full h-8 text-xs"
-            :disabled="applying || !selectedDevice || !selectedFormat"
+            size="sm"
+            class="w-full text-xs"
+            :disabled="applying || !selectedDevice || (!isSourceFollowing && !selectedFormat)"
             @click="applyVideoConfig"
           >
-            <Loader2 v-if="applying" class="h-3.5 w-3.5 mr-1.5 animate-spin" />
+            <Loader2 v-if="applying" class="size-3.5 mr-1.5 animate-spin" />
             <span>{{ applying ? t('actionbar.applying') : t('common.apply') }}</span>
           </Button>
           </div>

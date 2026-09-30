@@ -11,6 +11,21 @@ use typeshare::typeshare;
 
 #[typeshare]
 #[derive(Debug, Deserialize)]
+pub struct WatchdogConfigUpdate {
+    pub enabled: bool,
+}
+
+#[typeshare]
+#[derive(Debug, Serialize)]
+pub struct WatchdogConfigResponse {
+    pub enabled: bool,
+    pub supported: bool,
+    pub running: bool,
+    pub reason: Option<String>,
+}
+
+#[typeshare]
+#[derive(Debug, Deserialize)]
 pub struct AuthConfigUpdate {
     pub single_user_allow_multiple_sessions: Option<bool>,
 }
@@ -39,6 +54,22 @@ pub struct VideoConfigUpdate {
 }
 
 impl VideoConfigUpdate {
+    pub fn ignore_source_following_parameters(&mut self) {
+        if self.format.is_some()
+            || self.width.is_some()
+            || self.height.is_some()
+            || self.fps.is_some()
+        {
+            tracing::debug!(
+                "Ignoring client-supplied format, resolution, and FPS for source-following video input"
+            );
+        }
+        self.format = None;
+        self.width = None;
+        self.height = None;
+        self.fps = None;
+    }
+
     pub fn validate(&self) -> crate::error::Result<()> {
         if let Some(width) = self.width {
             if !(320..=7680).contains(&width) {
@@ -88,6 +119,32 @@ impl VideoConfigUpdate {
         if let Some(quality) = self.quality {
             config.quality = quality;
         }
+    }
+}
+
+#[cfg(test)]
+mod video_config_update_tests {
+    use super::VideoConfigUpdate;
+
+    #[test]
+    fn source_following_parameters_are_silently_discarded() {
+        let mut update = VideoConfigUpdate {
+            device: Some("/dev/video0".to_string()),
+            format: Some("MJPEG".to_string()),
+            width: Some(7680),
+            height: Some(4320),
+            fps: Some(120),
+            quality: Some(90),
+        };
+        update.ignore_source_following_parameters();
+
+        assert_eq!(update.device.as_deref(), Some("/dev/video0"));
+        assert!(update.format.is_none());
+        assert!(update.width.is_none());
+        assert!(update.height.is_none());
+        assert!(update.fps.is_none());
+        assert_eq!(update.quality, Some(90));
+        assert!(update.validate().is_ok());
     }
 }
 
@@ -345,22 +402,38 @@ impl Ch9329DescriptorConfigUpdate {
 #[typeshare]
 #[derive(Debug, Deserialize)]
 pub struct HidConfigUpdate {
+    /// Request-only; never persisted or replayed during startup.
+    pub bluetooth_reset_pairing: Option<bool>,
+    pub bluetooth: Option<crate::config::BluetoothHidConfig>,
     pub backend: Option<HidBackend>,
     pub ch9329_port: Option<String>,
     pub ch9329_baudrate: Option<u32>,
     pub ch9329_hybrid_mouse: Option<bool>,
+    #[serde(alias = "ch9329_macos_drag")]
+    pub mouse_macos_drag: Option<bool>,
     pub ch9329_descriptor: Option<Ch9329DescriptorConfigUpdate>,
     pub otg_udc: Option<String>,
     pub otg_descriptor: Option<OtgDescriptorConfigUpdate>,
     pub otg_profile: Option<OtgHidProfile>,
-    pub otg_endpoint_budget: Option<OtgEndpointBudget>,
     pub otg_functions: Option<OtgHidFunctionsUpdate>,
     pub otg_keyboard_leds: Option<bool>,
     pub mouse_absolute: Option<bool>,
 }
 
+#[typeshare]
+#[cfg(unix)]
+#[derive(Debug, Deserialize, Default)]
+pub struct OtgConfigUpdate {
+    pub hid: Option<HidConfigUpdate>,
+    pub msd: Option<MsdConfigUpdate>,
+    pub network: Option<OtgNetworkConfigUpdate>,
+}
+
 impl HidConfigUpdate {
     pub fn validate(&self) -> crate::error::Result<()> {
+        if let Some(config) = &self.bluetooth {
+            config.validate()?;
+        }
         if let Some(baudrate) = self.ch9329_baudrate {
             let valid_rates = [9600, 19200, 38400, 57600, 115200];
             if !valid_rates.contains(&baudrate) {
@@ -379,6 +452,9 @@ impl HidConfigUpdate {
     }
 
     pub fn apply_to(&self, config: &mut HidConfig) {
+        if let Some(bluetooth) = &self.bluetooth {
+            config.bluetooth = bluetooth.clone();
+        }
         if let Some(backend) = self.backend.clone() {
             config.backend = backend;
         }
@@ -391,6 +467,9 @@ impl HidConfigUpdate {
         if let Some(enabled) = self.ch9329_hybrid_mouse {
             config.ch9329_hybrid_mouse = enabled;
         }
+        if let Some(enabled) = self.mouse_macos_drag {
+            config.mouse_macos_drag = enabled;
+        }
         if let Some(ref desc) = self.ch9329_descriptor {
             desc.apply_to(&mut config.ch9329_descriptor);
         }
@@ -402,9 +481,6 @@ impl HidConfigUpdate {
         }
         if let Some(profile) = self.otg_profile.clone() {
             config.otg_profile = profile;
-        }
-        if let Some(budget) = self.otg_endpoint_budget {
-            config.otg_endpoint_budget = budget;
         }
         if let Some(ref functions) = self.otg_functions {
             functions.apply_to(&mut config.otg_functions);
@@ -421,9 +497,43 @@ impl HidConfigUpdate {
 #[typeshare]
 #[cfg(unix)]
 #[derive(Debug, Deserialize)]
+pub struct OtgNetworkConfigUpdate {
+    pub enabled: Option<bool>,
+    pub driver_mode: Option<OtgNetworkDriverMode>,
+    pub bridge_interface: Option<String>,
+    pub host_mac: Option<String>,
+    pub device_mac: Option<String>,
+}
+
+#[cfg(unix)]
+impl OtgNetworkConfigUpdate {
+    pub fn apply_to(&self, config: &mut OtgNetworkConfig) {
+        if let Some(enabled) = self.enabled {
+            config.enabled = enabled;
+        }
+        if let Some(driver_mode) = self.driver_mode {
+            config.driver_mode = driver_mode;
+        }
+        if let Some(ref interface) = self.bridge_interface {
+            config.bridge_interface = interface.trim().to_string();
+        }
+        if let Some(ref mac) = self.host_mac {
+            config.host_mac = mac.trim().to_ascii_lowercase();
+        }
+        if let Some(ref mac) = self.device_mac {
+            config.device_mac = mac.trim().to_ascii_lowercase();
+        }
+    }
+}
+
+#[typeshare]
+#[cfg(unix)]
+#[derive(Debug, Deserialize)]
 pub struct MsdConfigUpdate {
     pub enabled: Option<bool>,
     pub msd_dir: Option<String>,
+    pub flash_inquiry_string: Option<String>,
+    pub cdrom_inquiry_string: Option<String>,
 }
 
 #[cfg(unix)]
@@ -440,6 +550,12 @@ impl MsdConfigUpdate {
                 ));
             }
         }
+        if let Some(ref value) = self.flash_inquiry_string {
+            MsdConfig::validate_inquiry_string("Flash", value)?;
+        }
+        if let Some(ref value) = self.cdrom_inquiry_string {
+            MsdConfig::validate_inquiry_string("CD-ROM", value)?;
+        }
         Ok(())
     }
 
@@ -449,6 +565,12 @@ impl MsdConfigUpdate {
         }
         if let Some(ref dir) = self.msd_dir {
             config.msd_dir = dir.trim().to_string();
+        }
+        if let Some(ref value) = self.flash_inquiry_string {
+            config.flash_inquiry_string = value.trim().to_string();
+        }
+        if let Some(ref value) = self.cdrom_inquiry_string {
+            config.cdrom_inquiry_string = value.trim().to_string();
         }
     }
 }
@@ -791,7 +913,9 @@ fn validate_rustdesk_relay_key(key: &str) -> Result<(), AppError> {
 #[derive(Debug, Deserialize)]
 pub struct RustDeskConfigUpdate {
     pub enabled: Option<bool>,
+    pub mode: Option<crate::rustdesk::config::RustDeskMode>,
     pub codec: Option<crate::rustdesk::config::RustDeskCodec>,
+    pub direct_access_port: Option<u16>,
     pub rendezvous_server: Option<String>,
     pub relay_server: Option<String>,
     pub relay_key: Option<String>,
@@ -800,6 +924,11 @@ pub struct RustDeskConfigUpdate {
 
 impl RustDeskConfigUpdate {
     pub fn validate(&self) -> crate::error::Result<()> {
+        if self.direct_access_port == Some(0) {
+            return Err(AppError::BadRequest(
+                "RustDesk direct access port must be greater than 0".into(),
+            ));
+        }
         // Validate rendezvous server format (should be host:port)
         if let Some(ref server) = self.rendezvous_server {
             if !server.is_empty() && !server.contains(':') {
@@ -836,10 +965,24 @@ impl RustDeskConfigUpdate {
     }
 
     pub fn validate_merged(&self, config: &RustDeskConfig) -> crate::error::Result<()> {
-        if config.enabled && config.rendezvous_server.trim().is_empty() {
-            return Err(AppError::BadRequest(
-                "RustDesk ID server is required".into(),
-            ));
+        if config.enabled {
+            match config.mode {
+                crate::rustdesk::config::RustDeskMode::Id
+                    if config.rendezvous_server.trim().is_empty() =>
+                {
+                    return Err(AppError::BadRequest(
+                        "RustDesk ID server is required in ID service mode".into(),
+                    ));
+                }
+                crate::rustdesk::config::RustDeskMode::DirectIp
+                    if config.direct_access_port == 0 =>
+                {
+                    return Err(AppError::BadRequest(
+                        "RustDesk direct access port must be greater than 0".into(),
+                    ));
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -848,8 +991,14 @@ impl RustDeskConfigUpdate {
         if let Some(enabled) = self.enabled {
             config.enabled = enabled;
         }
+        if let Some(mode) = self.mode {
+            config.mode = mode;
+        }
         if let Some(codec) = self.codec {
             config.codec = codec;
+        }
+        if let Some(port) = self.direct_access_port {
+            config.direct_access_port = port;
         }
         if let Some(ref server) = self.rendezvous_server {
             config.rendezvous_server = server.clone();
@@ -941,7 +1090,6 @@ pub struct VncConfigResponse {
     pub bind: String,
     pub port: u16,
     pub encoding: VncEncoding,
-    pub jpeg_quality: u8,
     pub allow_one_client: bool,
     pub has_password: bool,
 }
@@ -953,7 +1101,6 @@ impl From<&VncConfig> for VncConfigResponse {
             bind: config.bind.clone(),
             port: config.port,
             encoding: config.encoding.clone(),
-            jpeg_quality: config.jpeg_quality,
             allow_one_client: config.allow_one_client,
             has_password: config.password.as_deref().is_some_and(|p| !p.is_empty()),
         }
@@ -985,7 +1132,6 @@ pub struct VncConfigUpdate {
     pub bind: Option<String>,
     pub port: Option<u16>,
     pub encoding: Option<VncEncoding>,
-    pub jpeg_quality: Option<u8>,
     pub allow_one_client: Option<bool>,
     pub password: Option<String>,
 }
@@ -1000,13 +1146,6 @@ impl VncConfigUpdate {
         if let Some(ref bind) = self.bind {
             if bind.parse::<std::net::IpAddr>().is_err() {
                 return Err(AppError::BadRequest("VNC bind must be a valid IP".into()));
-            }
-        }
-        if let Some(quality) = self.jpeg_quality {
-            if !(10..=100).contains(&quality) {
-                return Err(AppError::BadRequest(
-                    "VNC JPEG quality must be 10-100".into(),
-                ));
             }
         }
         if let Some(ref password) = self.password {
@@ -1038,9 +1177,6 @@ impl VncConfigUpdate {
         }
         if let Some(ref encoding) = self.encoding {
             config.encoding = encoding.clone();
-        }
-        if let Some(quality) = self.jpeg_quality {
-            config.jpeg_quality = quality;
         }
         if let Some(allow_one_client) = self.allow_one_client {
             config.allow_one_client = allow_one_client;
@@ -1371,7 +1507,9 @@ mod tests {
     fn rustdesk_relay_key_accepts_hbbs_style_base64_32_bytes() {
         let update = RustDeskConfigUpdate {
             enabled: None,
+            mode: None,
             codec: None,
+            direct_access_port: None,
             rendezvous_server: None,
             relay_server: None,
             relay_key: Some("pLU0pEj2IZnNVKzrIO1pIdwGA3dOVJJLkFIYGOCGH1E=".to_string()),
@@ -1386,13 +1524,58 @@ mod tests {
         let not_32 = "AAAAAAAAAAAAAAAAAAAAAA==".to_string();
         let update = RustDeskConfigUpdate {
             enabled: None,
+            mode: None,
             codec: None,
+            direct_access_port: None,
             rendezvous_server: None,
             relay_server: None,
             relay_key: Some(not_32),
             device_password: None,
         };
         assert!(update.validate().is_err());
+    }
+
+    #[test]
+    fn rustdesk_direct_ip_mode_does_not_require_id_server() {
+        let mut config = RustDeskConfig::default();
+        config.enabled = true;
+        config.mode = crate::rustdesk::config::RustDeskMode::DirectIp;
+        config.rendezvous_server.clear();
+
+        let update = RustDeskConfigUpdate {
+            enabled: Some(true),
+            mode: Some(crate::rustdesk::config::RustDeskMode::DirectIp),
+            codec: None,
+            direct_access_port: Some(21118),
+            rendezvous_server: Some(String::new()),
+            relay_server: None,
+            relay_key: None,
+            device_password: None,
+        };
+
+        assert!(update.validate().is_ok());
+        assert!(update.validate_merged(&config).is_ok());
+    }
+
+    #[test]
+    fn rustdesk_id_mode_requires_id_server_when_enabled() {
+        let mut config = RustDeskConfig::default();
+        config.enabled = true;
+        config.mode = crate::rustdesk::config::RustDeskMode::Id;
+        config.rendezvous_server.clear();
+
+        let update = RustDeskConfigUpdate {
+            enabled: Some(true),
+            mode: Some(crate::rustdesk::config::RustDeskMode::Id),
+            codec: None,
+            direct_access_port: None,
+            rendezvous_server: Some(String::new()),
+            relay_server: None,
+            relay_key: None,
+            device_password: None,
+        };
+
+        assert!(update.validate_merged(&config).is_err());
     }
 
     #[test]
@@ -1403,7 +1586,6 @@ mod tests {
                 bind: Some(bind.to_string()),
                 port: Some(5900),
                 encoding: None,
-                jpeg_quality: None,
                 allow_one_client: None,
                 password: None,
             };
@@ -1422,7 +1604,6 @@ mod tests {
                 bind: Some(bind.to_string()),
                 port: Some(5900),
                 encoding: None,
-                jpeg_quality: None,
                 allow_one_client: None,
                 password: None,
             };
@@ -1471,5 +1652,28 @@ mod tests {
                 "bind address should fail: {bind}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_vnc_jpeg_quality_is_ignored_and_not_returned() {
+        let config: VncConfig = serde_json::from_value(serde_json::json!({
+            "enabled": false,
+            "bind": "0.0.0.0",
+            "port": 5900,
+            "encoding": "tight_jpeg",
+            "jpeg_quality": 37,
+            "allow_one_client": true
+        }))
+        .expect("legacy VNC config should deserialize");
+        let update: VncConfigUpdate = serde_json::from_value(serde_json::json!({
+            "jpeg_quality": 37,
+            "allow_one_client": false
+        }))
+        .expect("legacy VNC update should deserialize");
+        assert_eq!(update.allow_one_client, Some(false));
+
+        let response = serde_json::to_value(VncConfigResponse::from(&config))
+            .expect("VNC response should serialize");
+        assert!(response.get("jpeg_quality").is_none());
     }
 }

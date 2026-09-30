@@ -3,8 +3,8 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
-import { Label } from '@/components/ui/label'
 import { Progress } from '@/components/ui/progress'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { CornerDownLeft, Square, AlertCircle } from 'lucide-vue-next'
 import { charToKey, analyzeText } from '@/lib/charToHid'
 import { hidApi } from '@/api'
@@ -16,7 +16,7 @@ const emit = defineEmits<{
 const { t } = useI18n()
 
 const text = ref('')
-const textareaRef = ref<HTMLTextAreaElement | null>(null)
+const textareaRef = ref<{ focus: (options?: FocusOptions) => void } | null>(null)
 const isPasting = ref(false)
 const progress = ref(0)
 const currentChar = ref(0)
@@ -35,9 +35,7 @@ const hasUntypableChars = computed(() => {
 })
 
 onMounted(() => {
-  setTimeout(() => {
-    textareaRef.value?.focus()
-  }, 100)
+  textareaRef.value?.focus()
 })
 
 onUnmounted(() => {
@@ -183,36 +181,29 @@ function handleKeydown(e: KeyboardEvent) {
 
 <template>
   <div class="p-4 space-y-4">
-    <div class="space-y-1">
-      <h3 class="font-semibold text-sm">{{ t('paste.title') }}</h3>
-      <p class="text-xs text-muted-foreground">{{ t('paste.description') }}</p>
-    </div>
+    <h3 class="font-semibold text-sm">{{ t('paste.title') }}</h3>
 
-    <div class="space-y-2">
-      <Label for="paste-text">{{ t('paste.label') }}</Label>
-      <Textarea
-        id="paste-text"
-        ref="textareaRef"
-        v-model="text"
-        :placeholder="t('paste.placeholder')"
-        class="min-h-[120px] resize-none font-mono text-sm"
-        :disabled="isPasting"
-        @keydown="handleKeydown"
-        @keyup.stop
-      />
-    </div>
+    <Textarea
+      id="paste-text"
+      ref="textareaRef"
+      v-model="text"
+      :aria-label="t('paste.title')"
+      :placeholder="t('paste.placeholder')"
+      class="min-h-[120px] resize-none text-sm"
+      :disabled="isPasting"
+      @keydown="handleKeydown"
+      @keyup.stop
+    />
 
     <!-- Warning for untypable characters -->
-    <div v-if="hasUntypableChars && !isPasting" class="flex items-start gap-2 p-2 rounded-md bg-amber-500/10 text-amber-600 dark:text-amber-400">
-      <AlertCircle class="h-4 w-4 shrink-0 mt-0.5" />
-      <div class="text-xs">
-        <p class="font-medium">{{ t('paste.untypableWarning') }}</p>
-        <p class="text-muted-foreground mt-0.5">
+    <Alert v-if="hasUntypableChars && !isPasting" variant="warning">
+      <AlertCircle class="size-4 shrink-0 mt-0.5" />
+      <AlertTitle>{{ t('paste.untypableWarning') }}</AlertTitle>
+      <AlertDescription>
           {{ t('paste.untypableChars', { chars: textAnalysis?.untypableChars.slice(0, 5).map(c => c === '\n' ? '\\n' : c === '\r' ? '\\r' : c === '\t' ? '\\t' : c).join(', ') }) }}
           <span v-if="textAnalysis && textAnalysis.untypableChars.length > 5">...</span>
-        </p>
-      </div>
-    </div>
+      </AlertDescription>
+    </Alert>
 
     <!-- Progress indicator during paste -->
     <div v-if="isPasting" class="space-y-2">
@@ -235,7 +226,7 @@ function handleKeydown(e: KeyboardEvent) {
           {{ t('common.cancel') }}
         </Button>
         <Button v-else variant="ghost" size="sm" @click="cancelPaste">
-          <Square class="h-3 w-3 mr-1.5 fill-current" />
+          <Square class="size-3 mr-1.5 fill-current" />
           {{ t('paste.stop') }}
         </Button>
         <Button
@@ -243,7 +234,7 @@ function handleKeydown(e: KeyboardEvent) {
           :disabled="!text.trim() || isPasting"
           @click="handlePaste"
         >
-          <CornerDownLeft class="h-4 w-4 mr-1.5" />
+          <CornerDownLeft class="size-4 mr-1.5" />
           {{ t('paste.confirm') }}
         </Button>
       </div>

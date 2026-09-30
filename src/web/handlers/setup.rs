@@ -30,12 +30,12 @@ pub struct SetupRequest {
     // Audio settings
     pub audio_device: Option<String>,
     // HID settings
-    pub hid_backend: Option<String>,
+    pub hid_backend: Option<crate::config::HidBackend>,
+    pub hid_bluetooth: Option<crate::config::BluetoothHidConfig>,
     pub hid_ch9329_port: Option<String>,
     pub hid_ch9329_baudrate: Option<u32>,
     pub hid_otg_udc: Option<String>,
     pub hid_otg_profile: Option<String>,
-    pub hid_otg_endpoint_budget: Option<crate::config::OtgEndpointBudget>,
     pub hid_otg_keyboard_leds: Option<bool>,
     pub msd_enabled: Option<bool>,
     // Extension settings
@@ -43,9 +43,41 @@ pub struct SetupRequest {
     pub rustdesk_enabled: Option<bool>,
 }
 
+impl SetupRequest {
+    fn hid_config(&self, current: &crate::config::HidConfig) -> Result<crate::config::HidConfig> {
+        let mut hid = current.clone();
+        if let Some(backend) = &self.hid_backend {
+            hid.backend = backend.clone();
+        }
+        if let Some(bluetooth) = &self.hid_bluetooth {
+            hid.bluetooth = bluetooth.clone();
+        }
+        if let Some(port) = &self.hid_ch9329_port {
+            hid.ch9329_port = port.clone();
+        }
+        if let Some(baudrate) = self.hid_ch9329_baudrate {
+            hid.ch9329_baudrate = baudrate;
+        }
+        if let Some(udc) = &self.hid_otg_udc {
+            hid.otg_udc = Some(udc.clone());
+        }
+        if let Some(profile) = &self.hid_otg_profile {
+            if let Some(parsed) = crate::config::OtgHidProfile::from_legacy_str(profile) {
+                hid.otg_profile = parsed;
+            }
+        }
+        if let Some(enabled) = self.hid_otg_keyboard_leds {
+            hid.otg_keyboard_leds = enabled;
+        }
+        hid.bluetooth.validate()?;
+        hid.validate_otg_functions()?;
+        Ok(hid)
+    }
+}
+
 pub async fn setup_init(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<SetupRequest>,
+    Json(mut req): Json<SetupRequest>,
 ) -> Result<Json<LoginResponse>> {
     // Check if already initialized
     if state.config.is_initialized() {
@@ -65,6 +97,41 @@ pub async fn setup_init(
             "Password must be at least 4 characters".to_string(),
         ));
     }
+
+    if let Some(path) = req.video_device.as_deref() {
+        let source_following = state
+            .stream_manager
+            .list_devices()
+            .await
+            .ok()
+            .and_then(|devices| {
+                devices
+                    .into_iter()
+                    .find(|device| device.path.to_string_lossy() == path)
+            })
+            .is_some_and(|device| {
+                device.control_mode == crate::video::device::VideoControlMode::SourceFollowing
+            });
+        if source_following {
+            if req.video_format.is_some()
+                || req.video_width.is_some()
+                || req.video_height.is_some()
+                || req.video_fps.is_some()
+            {
+                tracing::debug!(
+                    "Ignoring setup-supplied format, resolution, and FPS for source-following video input"
+                );
+            }
+            req.video_format = None;
+            req.video_width = None;
+            req.video_height = None;
+            req.video_fps = None;
+        }
+    }
+
+    let old_config = state.config.get();
+    // Validate the selected HID configuration before creating the one-time account.
+    let hid_config = req.hid_config(&old_config.hid)?;
 
     // Create single system user
     state
@@ -102,33 +169,7 @@ pub async fn setup_init(
             }
 
             // HID settings
-            if let Some(backend) = req.hid_backend.clone() {
-                config.hid.backend = match backend.as_str() {
-                    "otg" => crate::config::HidBackend::Otg,
-                    "ch9329" => crate::config::HidBackend::Ch9329,
-                    _ => crate::config::HidBackend::None,
-                };
-            }
-            if let Some(port) = req.hid_ch9329_port.clone() {
-                config.hid.ch9329_port = port;
-            }
-            if let Some(baudrate) = req.hid_ch9329_baudrate {
-                config.hid.ch9329_baudrate = baudrate;
-            }
-            if let Some(udc) = req.hid_otg_udc.clone() {
-                config.hid.otg_udc = Some(udc);
-            }
-            if let Some(profile) = req.hid_otg_profile.clone() {
-                if let Some(parsed) = crate::config::OtgHidProfile::from_legacy_str(&profile) {
-                    config.hid.otg_profile = parsed;
-                }
-            }
-            if let Some(budget) = req.hid_otg_endpoint_budget {
-                config.hid.otg_endpoint_budget = budget;
-            }
-            if let Some(enabled) = req.hid_otg_keyboard_leds {
-                config.hid.otg_keyboard_leds = enabled;
-            }
+            config.hid = hid_config.clone();
             if let Some(enabled) = req.msd_enabled {
                 config.msd.enabled = enabled;
             }
@@ -144,18 +185,10 @@ pub async fn setup_init(
         })
         .await?;
 
-    // Get updated config for HID reload
+    // Apply the complete USB runtime configuration, including the MSD controller.
     let new_config = state.config.get();
-
-    #[cfg(unix)]
-    {
-        if let Err(e) = state
-            .otg_service
-            .apply_config(&new_config.hid, &new_config.msd)
-            .await
-        {
-            tracing::warn!("Failed to apply OTG config during setup: {}", e);
-        }
+    if let Err(e) = state.usb.apply_config(&old_config, &new_config).await {
+        tracing::warn!("Failed to apply USB config during setup: {}", e);
     }
 
     tracing::info!(
@@ -163,25 +196,6 @@ pub async fn setup_init(
         new_config.extensions.ttyd.enabled,
         new_config.rustdesk.enabled
     );
-
-    // Initialize HID backend with new config
-    let new_hid_backend = match new_config.hid.backend {
-        crate::config::HidBackend::Otg => crate::hid::HidBackendType::Otg,
-        crate::config::HidBackend::Ch9329 => crate::hid::HidBackendType::Ch9329 {
-            port: new_config.hid.ch9329_port.clone(),
-            baud_rate: new_config.hid.ch9329_baudrate,
-            hybrid_mouse: new_config.hid.ch9329_hybrid_mouse,
-        },
-        crate::config::HidBackend::None => crate::hid::HidBackendType::None,
-    };
-
-    // Reload HID backend
-    if let Err(e) = state.hid.reload(new_hid_backend).await {
-        tracing::warn!("Failed to initialize HID backend during setup: {}", e);
-        // Don't fail setup, just warn
-    } else {
-        tracing::info!("HID backend initialized: {:?}", new_config.hid.backend);
-    }
 
     // Start extensions if enabled
     if new_config.extensions.ttyd.enabled {
@@ -199,13 +213,14 @@ pub async fn setup_init(
     // Start RustDesk if enabled
     if new_config.rustdesk.enabled {
         let empty_config = crate::rustdesk::config::RustDeskConfig::default();
-        if let Err(e) = config::apply::apply_rustdesk_config(
-            &state,
-            &empty_config,
-            &new_config.rustdesk,
-            ConfigApplyOptions::default(),
-        )
-        .await
+        if let Err(e) = state
+            .remote_access
+            .apply_rustdesk(
+                &empty_config,
+                &new_config.rustdesk,
+                ConfigApplyOptions::default(),
+            )
+            .await
         {
             tracing::warn!("Failed to start RustDesk during setup: {}", e);
         } else {
@@ -216,13 +231,14 @@ pub async fn setup_init(
     // Start RTSP if enabled
     if new_config.rtsp.enabled {
         let empty_config = crate::config::RtspConfig::default();
-        if let Err(e) = config::apply::apply_rtsp_config(
-            &state,
-            &empty_config,
-            &new_config.rtsp,
-            ConfigApplyOptions::default(),
-        )
-        .await
+        if let Err(e) = state
+            .remote_access
+            .apply_rtsp(
+                &empty_config,
+                &new_config.rtsp,
+                ConfigApplyOptions::default(),
+            )
+            .await
         {
             tracing::warn!("Failed to start RTSP during setup: {}", e);
         } else {
@@ -260,4 +276,107 @@ pub async fn setup_init(
         success: true,
         message: Some("Setup completed".to_string()),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AppConfig, HidBackend, HidConfig, OtgHidProfile};
+    use serde_json::{json, Value};
+
+    fn request(mut hid: Value) -> SetupRequest {
+        hid["username"] = json!("admin");
+        hid["password"] = json!("test-password");
+        serde_json::from_value(hid).unwrap()
+    }
+
+    #[test]
+    fn setup_applies_selected_otg_device_and_legacy_options() {
+        let req = request(json!({
+            "hid_backend": "otg",
+            "hid_otg_udc": "fe800000.usb",
+            "hid_otg_profile": "full_no_consumer_no_msd",
+            "hid_otg_keyboard_leds": true
+        }));
+        let hid = req.hid_config(&HidConfig::default()).unwrap();
+        assert_eq!(hid.backend, HidBackend::Otg);
+        assert_eq!(hid.otg_udc.as_deref(), Some("fe800000.usb"));
+        assert_eq!(hid.otg_profile, OtgHidProfile::FullNoConsumer);
+        assert!(hid.effective_otg_keyboard_leds());
+    }
+
+    #[test]
+    fn setup_applies_selected_ch9329_port_and_baudrate() {
+        let req = request(json!({
+            "hid_backend": "ch9329",
+            "hid_ch9329_port": "/dev/ttyUSB2",
+            "hid_ch9329_baudrate": 115200
+        }));
+        let hid = req.hid_config(&HidConfig::default()).unwrap();
+        assert_eq!(hid.backend, HidBackend::Ch9329);
+        assert_eq!(hid.ch9329_port, "/dev/ttyUSB2");
+        assert_eq!(hid.ch9329_baudrate, 115200);
+    }
+
+    #[test]
+    fn setup_applies_bluetooth_selection_and_usb_invariants() {
+        let req = request(json!({
+            "hid_backend": "bluetooth",
+            "hid_bluetooth": { "adapter": "hci1", "name": "My KVM" }
+        }));
+        let mut config = AppConfig::default();
+        config.hid = req.hid_config(&config.hid).unwrap();
+        config.hid.mouse_absolute = true;
+        config.msd.enabled = true;
+        config.otg_network.enabled = true;
+        config.uac.enabled = true;
+        config.enforce_invariants();
+
+        assert_eq!(config.hid.backend, HidBackend::Bluetooth);
+        assert_eq!(config.hid.bluetooth.adapter, "hci1");
+        assert_eq!(config.hid.bluetooth.name, "My KVM");
+        assert_eq!(config.hid.bluetooth.peer, None);
+        assert!(!config.hid.mouse_absolute);
+        assert!(!config.msd.enabled && !config.otg_network.enabled && !config.uac.enabled);
+    }
+
+    #[test]
+    fn setup_preserves_omitted_settings_and_allows_explicit_disable() {
+        let current = HidConfig {
+            backend: HidBackend::Ch9329,
+            ch9329_port: "COM7".into(),
+            ch9329_baudrate: 57600,
+            ..Default::default()
+        };
+        assert_eq!(request(json!({})).hid_config(&current).unwrap(), current);
+        let disabled = request(json!({ "hid_backend": "none" }))
+            .hid_config(&current)
+            .unwrap();
+        assert_eq!(disabled.backend, HidBackend::None);
+        assert_eq!(disabled.ch9329_port, current.ch9329_port);
+        assert_eq!(disabled.ch9329_baudrate, current.ch9329_baudrate);
+    }
+
+    #[test]
+    fn setup_rejects_unknown_backend_instead_of_disabling_hid() {
+        assert!(serde_json::from_value::<SetupRequest>(json!({
+            "username": "admin", "password": "test-password",
+            "hid_backend": "unsupported"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn setup_rejects_invalid_bluetooth_configuration() {
+        for bluetooth in [
+            json!({ "adapter": "/dev/hci0", "name": "My KVM" }),
+            json!({ "adapter": "hci0", "name": "" }),
+            json!({ "adapter": "hci0", "name": "蓝".repeat(24) }),
+        ] {
+            let req = request(json!({
+                "hid_backend": "bluetooth", "hid_bluetooth": bluetooth
+            }));
+            assert!(req.hid_config(&HidConfig::default()).is_err());
+        }
+    }
 }

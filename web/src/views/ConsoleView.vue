@@ -10,10 +10,14 @@ import { useConsoleEvents } from '@/composables/useConsoleEvents'
 import { useHidWebSocket } from '@/composables/useHidWebSocket'
 import { useWebRTC } from '@/composables/useWebRTC'
 import { useVideoSession } from '@/composables/useVideoSession'
+import { useVideoScaling, type VideoRotation } from '@/composables/useVideoScaling'
 import { useComputerUseSocket, type ComputerUseServerMessage } from '@/composables/useComputerUseSocket'
 import { useFeatureVisibility } from '@/composables/useFeatureVisibility'
+import { useTheme } from '@/composables/useTheme'
+import { useConsoleLayout } from '@/composables/useConsoleLayout'
 import { getUnifiedAudio } from '@/composables/useUnifiedAudio'
-import { streamApi, hidApi, atxApi, atxConfigApi, authApi, computerUseApi } from '@/api'
+import { getMicrophone } from '@/composables/useMicrophone'
+import { streamApi, hidApi, atxApi, atxConfigApi, authApi, computerUseApi, uacApi } from '@/api'
 import type { ComputerUseScreenshot, ComputerUseSession } from '@/api'
 import { CanonicalKey, HidBackend } from '@/types/generated'
 import type { HidKeyboardEvent, HidMouseEvent } from '@/types/hid'
@@ -21,14 +25,18 @@ import { keyboardEventToCanonicalKey, updateModifierMaskForKey } from '@/lib/key
 import { toast } from 'vue-sonner'
 import { cn, generateUUID } from '@/lib/utils'
 import { formatFpsValue } from '@/lib/fps'
+import { getHidStatus } from '@/lib/hidStatus'
 import { videoDebugLog } from '@/lib/debugLog'
 import { formatVideoDeviceLabel } from '@/lib/video-device-label'
 import { isAudioDeviceLostStateReason, isAudioStreamDeviceLostPayload } from '@/lib/streamSignal'
-import type { StreamDeviceLostEventData } from '@/types/websocket'
+import type { StreamDeviceLostEventData, StreamStateChangedEventData } from '@/types/websocket'
 import type { VideoMode } from '@/components/VideoConfigPopover.vue'
 
-import StatusCard, { type StatusDetail } from '@/components/StatusCard.vue'
+import StatusCard, { type StatusDetail, type ConnectionStatus } from '@/components/StatusCard.vue'
 import ActionBar from '@/components/ActionBar.vue'
+import ConsoleHeaderActions from '@/components/ConsoleHeaderActions.vue'
+import { provideConsoleAppearance } from '@/composables/useConsoleAppearance'
+import ConsoleStatusSummary, { type ConsoleStatusItem } from '@/components/ConsoleStatusSummary.vue'
 import InfoBar from '@/components/InfoBar.vue'
 import VirtualKeyboard from '@/components/VirtualKeyboard.vue'
 import StatsSheet from '@/components/StatsSheet.vue'
@@ -75,6 +83,11 @@ const { connected: wsConnected, networkError: wsNetworkError } = useWebSocket()
 const hidWs = useHidWebSocket()
 const webrtc = useWebRTC()
 const unifiedAudio = getUnifiedAudio()
+const microphone = getMicrophone()
+const uacEnabled = ref(false)
+const microphoneTransferEnabled = computed(() => (
+  uacEnabled.value && configStore.hid?.backend === HidBackend.Otg
+))
 const videoSession = useVideoSession()
 
 const consoleEvents = useConsoleEvents({
@@ -92,6 +105,19 @@ const consoleEvents = useConsoleEvents({
 })
 
 const videoMode = ref<VideoMode>('mjpeg')
+const VIDEO_ROTATIONS: VideoRotation[] = [0, 90, 180, 270]
+const storedVideoRotation = Number(localStorage.getItem('videoRotation'))
+const videoRotation = ref<VideoRotation>(
+  VIDEO_ROTATIONS.includes(storedVideoRotation as VideoRotation)
+    ? storedVideoRotation as VideoRotation
+    : 0,
+)
+
+function setVideoRotation(rotation: VideoRotation) {
+  if (!VIDEO_ROTATIONS.includes(rotation)) return
+  videoRotation.value = rotation
+  localStorage.setItem('videoRotation', String(rotation))
+}
 const computerUseOpen = ref(false)
 const computerUseSession = ref<ComputerUseSession | null>(null)
 const computerUseTimeline = ref<ComputerUseTimelineItem[]>([])
@@ -107,6 +133,7 @@ const videoError = ref(false)
 const videoErrorMessage = ref('')
 const videoRestarting = ref(false)
 const mjpegFrameReceived = ref(false)
+let recoveryEventHandled = false
 
 /** From `stream.state_changed`: ok | no_signal | device_lost | device_busy */
 type StreamSignalState = 'ok' | 'no_signal' | 'device_lost' | 'device_busy'
@@ -114,7 +141,18 @@ const streamSignalState = ref<StreamSignalState>('ok')
 const streamSignalReason = ref<string | null>(null)
 const streamNextRetryMs = ref<number | null>(null)
 
-const videoAspectRatio = ref<string | null>(null)
+const {
+  workspaceRef: videoWorkspaceRef,
+  scaleMode: videoScaleMode,
+  sourceSize: videoSourceSize,
+  sourceSizeAvailable,
+  stageClass: videoStageClass,
+  containerStyle: videoContainerStyle,
+  contentStyle: videoContentStyle,
+  updateSourceSize: updateVideoSourceSize,
+  clearSourceSize: clearVideoSourceSize,
+  setScaleMode: setVideoScaleMode,
+} = useVideoScaling({ rotation: videoRotation })
 
 const backendFps = ref(0)
 
@@ -147,6 +185,34 @@ const isPointerLocked = ref(false)
 
 const localCrosshairPos = ref<{ x: number; y: number } | null>(null)
 
+interface TouchPointerState {
+  pointerId: number
+  mode: 'absolute' | 'relative'
+  startX: number
+  startY: number
+  lastX: number
+  lastY: number
+  maxDistanceSquared: number
+  longPressTimer: ReturnType<typeof setTimeout> | null
+  leftButtonDown: boolean
+  doubleTapCandidate: boolean
+}
+
+interface PendingTouchTap {
+  mode: 'absolute' | 'relative'
+  x: number
+  y: number
+  timestamp: number
+  timer: ReturnType<typeof setTimeout> | null
+}
+
+const TOUCH_TAP_MOVE_THRESHOLD_PX = 8
+const TOUCH_LONG_PRESS_MS = 450
+const TOUCH_DOUBLE_TAP_MS = 300
+const TOUCH_DOUBLE_TAP_DISTANCE_PX = 24
+let touchPointer: TouchPointerState | null = null
+let pendingTouchTap: PendingTouchTap | null = null
+
 const DEFAULT_MOUSE_MOVE_SEND_INTERVAL_MS = 16
 let mouseMoveSendIntervalMs = DEFAULT_MOUSE_MOVE_SEND_INTERVAL_MS
 let mouseFlushTimer: ReturnType<typeof setTimeout> | null = null
@@ -161,8 +227,9 @@ const isConsoleActive = ref(false)
 function syncMouseModeFromConfig() {
   const mouseAbsolute = configStore.hid?.mouse_absolute
   if (typeof mouseAbsolute !== 'boolean') return
-  const nextMode: 'absolute' | 'relative' = mouseAbsolute ? 'absolute' : 'relative'
+  const nextMode: 'absolute' | 'relative' = mouseAbsolute && configStore.hid?.backend !== 'bluetooth' ? 'absolute' : 'relative'
   if (mouseMode.value !== nextMode) {
+    resetTouchInput()
     mouseMode.value = nextMode
   }
 }
@@ -187,14 +254,20 @@ const changingPassword = ref(false)
 const ttydStatus = ref<{ available: boolean; running: boolean } | null>(null)
 const showTerminalDialog = ref(false)
 const featureVisibility = useFeatureVisibility()
+const { isDark, toggleTheme } = useTheme()
+const { consoleLayout } = useConsoleLayout()
+provideConsoleAppearance(consoleLayout)
 const terminalAvailable = computed(() => ttydStatus.value?.available !== false)
+const showPower = computed(() => featureVisibility.value.power)
 const showTerminal = computed(() => terminalAvailable.value && featureVisibility.value.webTerminal)
 const showComputerUse = computed(() => featureVisibility.value.computerUse)
+const showPasteText = computed(() => featureVisibility.value.pasteText)
 
-const isDark = ref(document.documentElement.classList.contains('dark'))
-
-const videoStatus = computed<'connected' | 'connecting' | 'disconnected' | 'error'>(() => {
+const videoStatus = computed<ConnectionStatus>(() => {
   if (wsNetworkError.value) return 'connecting'
+  if (streamSignalState.value === 'no_signal') return 'no_signal'
+  if (streamSignalState.value === 'device_busy') return 'busy'
+  if (streamSignalState.value === 'device_lost') return 'error'
 
   if (videoError.value) return 'error'
   if (videoLoading.value) return 'connecting'
@@ -205,6 +278,24 @@ const videoStatus = computed<'connected' | 'connecting' | 'disconnected' | 'erro
   if (videoMode.value === 'mjpeg' && mjpegFrameReceived.value) return 'connected'
   if (systemStore.stream?.online) return 'connected'
   return 'disconnected'
+})
+
+// Optional idle devices are neutral; video and HID must stay visible when unavailable.
+const consoleStatusItems = computed<ConsoleStatusItem[]>(() => {
+  const items: ConsoleStatusItem[] = [
+    { id: 'video', title: t('statusCard.video'), status: videoStatus.value,
+      quickInfo: videoQuickInfo.value, details: videoDetails.value, required: true,
+      errorMessage: showSignalOverlay.value ? signalOverlayInfo.value.title : videoErrorMessage.value },
+    { id: 'audio', title: t('statusCard.audio'), status: audioStatus.value,
+      quickInfo: audioQuickInfo.value, details: audioDetails.value, errorMessage: audioErrorMessage.value },
+    { id: 'hid', title: t('statusCard.hid'), status: hidStatus.value,
+      quickInfo: hidQuickInfo.value, details: hidDetails.value, errorMessage: hidErrorMessage.value, required: true },
+  ]
+  if (showMsdStatusCard.value) items.push({
+    id: 'msd', title: t('statusCard.msd'), status: msdStatus.value,
+    quickInfo: msdQuickInfo.value, details: msdDetails.value, errorMessage: msdErrorMessage.value,
+  })
+  return items
 })
 
 function openStatsSheet() {
@@ -239,6 +330,7 @@ const isMjpegPaused = computed(() => {
 })
 
 const videoQuickInfo = computed(() => {
+  if (videoStatus.value === 'no_signal' || videoStatus.value === 'busy') return t(`status.${videoStatus.value}`)
   const stream = systemStore.stream
   if (!stream?.resolution) return ''
   const resShort = getResolutionShortName(stream.resolution[0], stream.resolution[1])
@@ -257,8 +349,9 @@ const videoDetails = computed<StatusDetail[]>(() => {
   const formatDisplay = inputFmt === outputFmt ? inputFmt : `${inputFmt} → ${outputFmt}`
 
   const targetFpsValue = formatFpsValue(stream.targetFps ?? 0)
-  const actualFpsValue = paused ? t('statusCard.paused') : formatFpsValue(receivedFps)
-  const actualStatus: StatusDetail['status'] = paused
+  const signalUnavailable = streamSignalState.value !== 'ok'
+  const actualFpsValue = signalUnavailable ? videoQuickInfo.value : paused ? t('statusCard.paused') : formatFpsValue(receivedFps)
+  const actualStatus: StatusDetail['status'] = signalUnavailable ? 'warning' : paused
     ? undefined
     : receivedFps > 5 ? 'ok'
       : receivedFps > 0 ? 'warning'
@@ -272,37 +365,18 @@ const videoDetails = computed<StatusDetail[]>(() => {
     { label: t('statusCard.fpsActual'), value: actualFpsValue, status: actualStatus },
   ]
 
-  if (videoMode.value === 'mjpeg' && !paused && receivedFps > 0 && receivedFps < (stream.targetFps ?? 0)) {
-    details.push({
-      label: '',
-      value: t('statusCard.fpsStaticHint'),
-    })
-  }
-
   return details
 })
 
-const hidStatus = computed<'connected' | 'connecting' | 'disconnected' | 'error'>(() => {
-  const hid = systemStore.hid
-  if (hid?.errorCode === 'udc_not_configured') return 'disconnected'
-  if (hid?.error) return 'error'
-
-  if (videoMode.value !== 'mjpeg') {
-    if (webrtc.dataChannelReady.value) return 'connected'
-    if (webrtc.isConnecting.value) return 'connecting'
-    if (webrtc.isConnected.value) return 'connecting'
-  }
-
-  if (hidWs.networkError.value) return 'connecting'
-
-  if (!hidWs.connected.value) return 'disconnected'
-
-  if (hidWs.hidUnavailable.value) return 'disconnected'
-
-  if (hid?.available && hid.online) return 'connected'
-  if (hid?.available && hid.initialized) return 'connecting'
-  return 'disconnected'
-})
+const hidStatus = computed(() => getHidStatus(systemStore.hid, {
+  useWebRtc: videoMode.value !== 'mjpeg',
+  dataChannelReady: webrtc.dataChannelReady.value,
+  rtcConnecting: webrtc.isConnecting.value,
+  rtcConnected: webrtc.isConnected.value,
+  wsConnected: hidWs.connected.value,
+  wsNetworkError: hidWs.networkError.value,
+  wsHidUnavailable: hidWs.hidUnavailable.value,
+}))
 
 const hidQuickInfo = computed(() => {
   const hid = systemStore.hid
@@ -438,14 +512,6 @@ const hidDetails = computed<StatusDetail[]>(() => {
   return details
 })
 
-const audioStatus = computed<'connected' | 'connecting' | 'disconnected' | 'error'>(() => {
-  const audio = systemStore.audio
-  if (!audio?.available) return 'disconnected'
-  if (audio.error) return 'error'
-  if (audio.streaming) return 'connected'
-  return 'disconnected'
-})
-
 function translateAudioQuality(quality: string | undefined): string {
   if (!quality) return t('common.unknown')
   const qualityLower = quality.toLowerCase()
@@ -455,43 +521,96 @@ function translateAudioQuality(quality: string | undefined): string {
   return quality
 }
 
+const microphoneTransferStatus = computed<{
+  text: string
+  card: 'connected' | 'connecting' | 'disconnected' | 'error'
+  detail?: StatusDetail['status']
+}>(() => {
+  switch (microphone.state.value) {
+    case 'starting':
+      return { text: t('statusCard.transferStarting'), card: 'connecting', detail: 'warning' }
+    case 'streaming':
+      if (microphone.targetState.value === 'active') {
+        return { text: t('statusCard.transferActive'), card: 'connected', detail: 'ok' }
+      }
+      if (microphone.targetState.value === 'stalled') {
+        return { text: t('statusCard.transferStalled'), card: 'connecting', detail: 'warning' }
+      }
+      return { text: t('statusCard.transferWaiting'), card: 'connecting', detail: 'warning' }
+    case 'stopping':
+      return { text: t('statusCard.transferStopping'), card: 'connecting', detail: 'warning' }
+    case 'error':
+      return { text: t('statusCard.transferError'), card: 'error', detail: 'error' }
+    case 'idle':
+    default:
+      return { text: t('statusCard.transferIdle'), card: 'disconnected' }
+  }
+})
+
+const audioStatus = computed<'connected' | 'connecting' | 'disconnected' | 'error'>(() => {
+  const transfer = microphoneTransferEnabled.value ? microphoneTransferStatus.value : null
+  if (systemStore.audio?.error || transfer?.card === 'error') return 'error'
+  if (transfer?.card === 'connecting') return 'connecting'
+  if (systemStore.audio?.streaming || transfer?.card === 'connected') return 'connected'
+  return 'disconnected'
+})
+
 const audioQuickInfo = computed(() => {
   const audio = systemStore.audio
-  if (!audio?.available) return ''
-  if (audio.streaming) return translateAudioQuality(audio.quality)
-  return t('statusCard.off')
+  const playback = audio?.streaming
+    ? t('statusCard.playbackActive')
+    : t('statusCard.playbackStopped')
+  return microphoneTransferEnabled.value
+    ? `${playback} · ${microphoneTransferStatus.value.text}`
+    : playback
 })
 
 const audioErrorMessage = computed(() => {
-  return systemStore.audio?.error || ''
+  if (systemStore.audio?.error) return systemStore.audio.error
+  if (!microphoneTransferEnabled.value) return ''
+  const code = microphone.errorCode.value
+  if (microphone.state.value === 'error' && code) {
+    return t(`actionbar.micError.${code}`)
+  }
+  return ''
 })
 
 const audioDetails = computed<StatusDetail[]>(() => {
   const audio = systemStore.audio
-  if (!audio) return []
-
-  return [
-    { label: t('statusCard.device'), value: audio.device || t('statusCard.defaultDevice') },
-    { label: t('statusCard.quality'), value: translateAudioQuality(audio.quality) },
-    { label: t('statusCard.streaming'), value: audio.streaming ? t('common.yes') : t('common.no'), status: audio.streaming ? 'ok' : undefined },
+  const details: StatusDetail[] = [
+    {
+      label: t('statusCard.audioPlayback'),
+      value: audio?.streaming ? t('statusCard.playbackActive') : t('statusCard.playbackStopped'),
+      status: audio?.error ? 'error' : audio?.streaming ? 'ok' : undefined,
+    },
   ]
+  if (microphoneTransferEnabled.value) {
+    details.push({
+      label: t('statusCard.audioTransfer'),
+      value: microphoneTransferStatus.value.text,
+      status: microphoneTransferStatus.value.detail,
+    })
+  }
+  details.push(
+    { label: t('statusCard.device'), value: audio?.device || t('statusCard.defaultDevice') },
+    { label: t('statusCard.quality'), value: translateAudioQuality(audio?.quality) },
+  )
+  return details
 })
 
 const msdStatus = computed<'connected' | 'connecting' | 'disconnected' | 'error'>(() => {
   const msd = systemStore.msd
   if (!msd?.available) return 'disconnected'
   if (msd.error) return 'error'
-  if (msd.connected) return 'connected'
+  if (msd.mountedCount > 0) return 'connected'
   return 'disconnected'
 })
 
 const msdQuickInfo = computed(() => {
   const msd = systemStore.msd
   if (!msd?.available) return ''
-  if (msd.mode === 'none') return t('statusCard.msdStandby')
-  if (msd.mode === 'image') return t('statusCard.msdImageMode')
-  if (msd.mode === 'drive') return t('statusCard.msdDriveMode')
-  return t('common.unknown')
+  if (msd.mountedCount === 0) return t('statusCard.msdStandby')
+  return msd.diskMode === 'single' ? t('msd.singleDiskMode') : t('msd.multiDiskMode')
 })
 
 const msdErrorMessage = computed(() => {
@@ -504,7 +623,7 @@ const msdDetails = computed<StatusDetail[]>(() => {
 
   const details: StatusDetail[] = []
 
-  if (msd.mode === 'none') {
+  if (msd.mountedCount === 0) {
     details.push({
       label: t('statusCard.msdStatus'),
       value: t('statusCard.msdStandby'),
@@ -518,23 +637,11 @@ const msdDetails = computed<StatusDetail[]>(() => {
     })
   }
 
-  const modeDisplay = msd.mode === 'none'
-    ? '-'
-    : msd.mode === 'image'
-      ? t('statusCard.msdImageMode')
-      : t('statusCard.msdDriveMode')
   details.push({
     label: t('statusCard.currentMode'),
-    value: modeDisplay,
-    status: msd.mode !== 'none' ? 'ok' : undefined
+    value: msd.diskMode === 'single' ? t('msd.singleDiskMode') : t('msd.multiDiskMode'),
+    status: msd.mountedCount > 0 ? 'ok' : undefined
   })
-
-  if (msd.mode === 'image') {
-    details.push({
-      label: t('statusCard.msdCurrentImage'),
-      value: msd.imageId || t('statusCard.msdNoImage')
-    })
-  }
 
   return details
 })
@@ -629,22 +736,15 @@ const connectProgress = computed<{ current: number; total: number } | null>(() =
   }
 })
 
-const videoContainerStyle = computed(() => {
-  if (!videoAspectRatio.value) {
-    return {
-      width: '100%',
-      height: '100%',
-      maxWidth: '100%',
-      maxHeight: '100%',
-      minHeight: '120px',
-    }
-  }
-  return {
-    aspectRatio: videoAspectRatio.value,
-    maxWidth: '100%',
-    maxHeight: '100%',
-    minHeight: '120px',
-  }
+function handleWebRTCVideoResize() {
+  if (videoMode.value === 'mjpeg') return
+  const video = webrtcVideoRef.value
+  if (!video) return
+  updateVideoSourceSize(video.videoWidth, video.videoHeight)
+}
+
+watch(videoLoading, (loading) => {
+  if (loading) clearVideoSourceSize()
 })
 
 const computerUsePanelVisible = computed(() => computerUseOpen.value && !isFullscreen.value)
@@ -669,6 +769,8 @@ let webrtcConnectTask: Promise<boolean> | null = null
 
 let webrtcRecoveryTimerId: number | null = null
 let webrtcRecoveryAttempts = 0
+let webrtcReconnectTimeout: ReturnType<typeof setTimeout> | null = null
+let webrtcReconnectFailures = 0
 const MAX_WEBRTC_RECOVERY_ATTEMPTS = 8
 const WEBRTC_RECOVERY_BASE_DELAY = 2000
 
@@ -763,9 +865,35 @@ function handleComputerUseMessage(message: ComputerUseServerMessage) {
     case 'actions_executed':
       pushComputerUseTimeline({ type: 'actions_executed', actions: message.actions })
       break
+    case 'step_started':
+      pushComputerUseTimeline({ type: 'reasoning', text: '', completed: false, failed: false })
+      break
+    case 'reasoning_delta': {
+      const last = computerUseTimeline.value[computerUseTimeline.value.length - 1]
+      if (last?.type === 'reasoning' && !last.completed) {
+        last.text += message.delta
+      } else {
+        pushComputerUseTimeline({ type: 'reasoning', text: message.delta, completed: false, failed: false })
+      }
+      break
+    }
+    case 'reasoning_completed': {
+      for (let index = computerUseTimeline.value.length - 1; index >= 0; index -= 1) {
+        const item = computerUseTimeline.value[index]
+        if (item?.type !== 'reasoning' || item.completed) continue
+        if (!message.failed && !item.text) {
+          computerUseTimeline.value.splice(index, 1)
+        } else {
+          item.completed = true
+          item.failed = message.failed
+        }
+        break
+      }
+      break
+    }
     case 'error':
       pushComputerUseTimeline({ type: 'error', text: message.message })
-      toast.error('Computer Use failed', { description: message.message })
+      toast.error(t('computerUse.errors.taskFailed'), { description: message.message })
       break
   }
 }
@@ -805,8 +933,8 @@ async function startComputerUse(prompt: string) {
     })
     computerUseConversationStarted.value = true
   } catch (err: any) {
-    pushComputerUseTimeline({ type: 'error', text: err?.message ?? 'Computer Use start failed' })
-    toast.error('Computer Use start failed', { description: err?.message })
+    pushComputerUseTimeline({ type: 'error', text: err?.message ?? t('computerUse.errors.startFailed') })
+    toast.error(t('computerUse.errors.startFailed'), { description: err?.message })
   }
 }
 
@@ -814,7 +942,7 @@ async function stopComputerUse() {
   try {
     computerUseSession.value = await computerUseApi.stop()
   } catch (err: any) {
-    toast.error('Computer Use stop failed', { description: err?.message })
+    toast.error(t('computerUse.errors.stopFailed'), { description: err?.message })
   }
 }
 
@@ -887,6 +1015,11 @@ async function waitForWebRTCReadyGate(reason: string, timeoutMs = 3000): Promise
 }
 
 async function connectWebRTCSerial(reason: string): Promise<boolean> {
+  if (videoMode.value === 'mjpeg') {
+    videoDebugLog('Skipping stale WebRTC connect request in MJPEG mode', { reason })
+    return false
+  }
+
   if (webrtcConnectTask) {
     videoDebugLog('Reusing serialized WebRTC connect task', {
       reason,
@@ -904,6 +1037,10 @@ async function connectWebRTCSerial(reason: string): Promise<boolean> {
   })
   webrtcConnectTask = (async () => {
     await waitForWebRTCReadyGate(reason)
+    if (videoMode.value === 'mjpeg') {
+      videoDebugLog('Discarding WebRTC connect after mode changed to MJPEG', { reason })
+      return false
+    }
     return webrtc.connect()
   })()
 
@@ -927,7 +1064,7 @@ function handleVideoLoad() {
     systemStore.setStreamOnline(true)
     const img = videoRef.value
     if (img && img.naturalWidth && img.naturalHeight) {
-      videoAspectRatio.value = `${img.naturalWidth}/${img.naturalHeight}`
+      updateVideoSourceSize(img.naturalWidth, img.naturalHeight)
     }
   }
 
@@ -1089,13 +1226,36 @@ function cancelWebRTCRecovery() {
   webrtcRecoveryAttempts = 0
 }
 
+async function stopWebRTCClientActivity() {
+  cancelWebRTCRecovery()
+  if (webrtcReconnectTimeout) {
+    clearTimeout(webrtcReconnectTimeout)
+    webrtcReconnectTimeout = null
+  }
+  await webrtc.disconnect()
+}
+
 function handleStreamRecovered(_data: { device: string }) {
   videoDebugLog('Stream recovered event', _data)
   cancelWebRTCRecovery()
+  recoveryEventHandled = true
 
   videoError.value = false
   videoErrorMessage.value = ''
-  refreshVideo()
+  if (videoMode.value === 'mjpeg') {
+    refreshVideo()
+  } else if (webrtc.isConnected.value) {
+    void rebindWebRTCVideo().then(() => {
+      videoLoading.value = false
+    })
+  } else if (!webrtc.isConnecting.value) {
+    void connectWebRTCSerial('stream recovered').then(async connected => {
+      if (connected) {
+        await rebindWebRTCVideo()
+        videoLoading.value = false
+      }
+    })
+  }
 }
 
 async function handleAudioStateChanged(data: { streaming: boolean; device: string | null }) {
@@ -1156,6 +1316,15 @@ async function handleStreamConfigApplied(_data: any) {
     webrtcStage: webrtc.connectStage.value,
   })
   consecutiveErrors = 0
+
+  // A source-following recovery emits `stream.recovered` followed by the
+  // actual geometry. The recovered handler already reconnected the current
+  // transport; do not initiate a second mode switch for the bookkeeping event.
+  if (recoveryEventHandled) {
+    recoveryEventHandled = false
+    videoRestarting.value = false
+    return
+  }
 
   gracePeriodTimeoutId = window.setTimeout(() => {
     gracePeriodTimeoutId = null
@@ -1220,7 +1389,7 @@ function handleStreamModeSwitching(data: { transition_id: string; to_mode: strin
   videoSession.onModeSwitching(data)
 }
 
-function handleStreamStateChanged(data: any) {
+function handleStreamStateChanged(data: StreamStateChangedEventData) {
   videoDebugLog('Stream state changed event', {
     data,
     videoMode: videoMode.value,
@@ -1262,8 +1431,27 @@ function handleStreamStateChanged(data: any) {
   } else if (state === 'no_signal' && videoMode.value !== 'mjpeg') {
     cancelWebRTCRecovery()
     videoRestarting.value = false
+    videoLoading.value = false
     videoError.value = false
     videoErrorMessage.value = ''
+    systemStore.setStreamOnline(false)
+    // Remove the stale decoded frame without closing the peer connection.
+    // The live WebRTC subscription is what keeps a source-following capture
+    // pipeline probing indefinitely; disconnecting here would drop the final
+    // subscriber and make recovery impossible without a page refresh.
+    if (webrtcVideoRef.value) {
+      webrtcVideoRef.value.pause()
+      webrtcVideoRef.value.srcObject = null
+    }
+  } else if (state === 'no_signal' && videoMode.value === 'mjpeg') {
+    systemStore.setStreamOnline(false)
+    videoLoading.value = false
+    mjpegFrameReceived.value = false
+    mjpegTimestamp.value = 0
+    if (videoRef.value) {
+      videoRef.value.src = ''
+      videoRef.value.removeAttribute('src')
+    }
   } else if (state === 'device_busy' && videoMode.value !== 'mjpeg') {
     cancelWebRTCRecovery()
     videoRestarting.value = true
@@ -1286,30 +1474,6 @@ function handleStreamStateChanged(data: any) {
     videoError.value = false
     videoErrorMessage.value = ''
     videoRestarting.value = false
-    if (
-      videoMode.value === 'mjpeg'
-      && (previous === 'no_signal' || previous === 'device_lost' || previous === 'device_busy')
-    ) {
-      refreshVideo()
-    } else if (
-      videoMode.value !== 'mjpeg'
-      && (previous === 'no_signal' || previous === 'device_busy' || previous === 'device_lost')
-    ) {
-      if (webrtc.isConnected.value && !webrtc.isConnecting.value) {
-        void rebindWebRTCVideo().then(() => {
-          videoLoading.value = false
-        })
-      } else if (!webrtc.isConnected.value && !webrtc.isConnecting.value) {
-        void connectWebRTCSerial('stream recovered').then(async (ok) => {
-          if (ok) {
-            await rebindWebRTCVideo()
-            videoLoading.value = false
-          } else if (webrtcRecoveryTimerId === null && webrtcRecoveryAttempts === 0) {
-            scheduleWebRTCRecovery()
-          }
-        })
-      }
-    }
   }
 }
 
@@ -1337,8 +1501,8 @@ const signalOverlayInfo = computed(() => {
     case 'no_signal':
       return {
         title: t('console.signal.noSignal.title'),
-        detail: t('console.signal.noSignal.detail'),
-        hint,
+        detail: hint || t('console.signal.noSignal.detail'),
+        hint: '',
         tone: 'info' as const,
       }
     case 'device_lost':
@@ -1619,6 +1783,7 @@ async function rebindWebRTCVideo() {
       } catch {
       }
       await waitForVideoFirstFrame(webrtcVideoRef.value, 2000)
+      handleWebRTCVideoResize()
       clearFrameOverlay()
     }
   }
@@ -1736,6 +1901,7 @@ async function switchToMJPEG() {
   videoError.value = false
   videoErrorMessage.value = ''
   pendingWebRTCReadyGate = false
+  await stopWebRTCClientActivity()
 
   try {
     const modeResp = await streamApi.setMode('mjpeg')
@@ -1749,10 +1915,6 @@ async function switchToMJPEG() {
     }
   } catch (e) {
     console.error('Failed to switch to MJPEG mode:', e)
-  }
-
-  if (webrtc.isConnected.value || webrtc.sessionId.value) {
-    await webrtc.disconnect()
   }
 
   if (webrtcVideoRef.value) {
@@ -1780,6 +1942,7 @@ function syncToServerMode(mode: VideoMode) {
   if (mode !== 'mjpeg') {
     connectWebRTCOnly(mode)
   } else {
+    void stopWebRTCClientActivity()
     refreshVideo()
   }
 }
@@ -1880,14 +2043,9 @@ watch(webrtc.stats, (stats) => {
   if (videoMode.value !== 'mjpeg' && stats.framesPerSecond > 0) {
     backendFps.value = Math.round(stats.framesPerSecond)
     systemStore.setStreamOnline(true)
-    if (stats.frameWidth && stats.frameHeight) {
-      videoAspectRatio.value = `${stats.frameWidth}/${stats.frameHeight}`
-    }
   }
 }, { deep: true })
 
-let webrtcReconnectTimeout: ReturnType<typeof setTimeout> | null = null
-let webrtcReconnectFailures = 0
 watch(() => webrtc.state.value, (newState, oldState) => {
   console.log('[WebRTC] State changed:', oldState, '->', newState)
   videoDebugLog('WebRTC state watcher observed change', {
@@ -1964,20 +2122,14 @@ watch(() => webrtc.state.value, (newState, oldState) => {
 })
 
 async function toggleFullscreen() {
-  if (!videoContainerRef.value) return
+  if (!videoWorkspaceRef.value) return
   if (!document.fullscreenElement) {
-    await videoContainerRef.value.requestFullscreen()
+    await videoWorkspaceRef.value.requestFullscreen()
     isFullscreen.value = true
   } else {
     await document.exitFullscreen()
     isFullscreen.value = false
   }
-}
-
-function toggleTheme() {
-  isDark.value = !isDark.value
-  document.documentElement.classList.toggle('dark', isDark.value)
-  localStorage.setItem('theme', isDark.value ? 'dark' : 'light')
 }
 
 async function logout() {
@@ -2171,10 +2323,8 @@ function getActiveVideoAspectRatio(): number | null {
     }
   }
 
-  if (!videoAspectRatio.value) return null
-  const [width, height] = videoAspectRatio.value.split('/').map(Number)
-  if (!width || !height) return null
-  return width / height
+  const source = videoSourceSize.value
+  return source ? source.width / source.height : null
 }
 
 function getRenderedVideoRect() {
@@ -2183,6 +2333,13 @@ function getRenderedVideoRect() {
 
   const rect = videoElement.getBoundingClientRect()
   if (rect.width <= 0 || rect.height <= 0) return null
+
+  // For a quarter turn, the transformed element already describes the exact
+  // visible portrait frame. Its original landscape aspect ratio must not be
+  // used to add artificial letterboxing here.
+  if (videoRotation.value === 90 || videoRotation.value === 270) {
+    return rect
+  }
 
   const contentAspectRatio = getActiveVideoAspectRatio()
   if (!contentAspectRatio) {
@@ -2213,6 +2370,32 @@ function getRenderedVideoRect() {
   }
 }
 
+function rotateAbsolutePosition(x: number, y: number) {
+  switch (videoRotation.value) {
+    case 90:
+      return { x: y, y: 1 - x }
+    case 180:
+      return { x: 1 - x, y: 1 - y }
+    case 270:
+      return { x: 1 - y, y: x }
+    default:
+      return { x, y }
+  }
+}
+
+function rotateRelativeDelta(dx: number, dy: number) {
+  switch (videoRotation.value) {
+    case 90:
+      return { dx: dy, dy: -dx }
+    case 180:
+      return { dx: -dx, dy: -dy }
+    case 270:
+      return { dx: -dy, dy: dx }
+    default:
+      return { dx, dy }
+  }
+}
+
 function getAbsoluteMousePosition(e: MouseEvent) {
   const rect = getRenderedVideoRect()
   if (!rect) return null
@@ -2220,9 +2403,24 @@ function getAbsoluteMousePosition(e: MouseEvent) {
   const normalizedX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
   const normalizedY = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height))
 
+  const sourcePosition = rotateAbsolutePosition(normalizedX, normalizedY)
   return {
-    x: Math.round(normalizedX * 32767),
-    y: Math.round(normalizedY * 32767),
+    x: Math.round(sourcePosition.x * 32767),
+    y: Math.round(sourcePosition.y * 32767),
+  }
+}
+
+function getLocalRenderedVideoBounds() {
+  const container = videoContainerRef.value
+  const renderedRect = getRenderedVideoRect()
+  if (!container || !renderedRect) return null
+
+  const containerRect = container.getBoundingClientRect()
+  return {
+    left: renderedRect.left - containerRect.left,
+    top: renderedRect.top - containerRect.top,
+    right: renderedRect.left - containerRect.left + renderedRect.width,
+    bottom: renderedRect.top - containerRect.top + renderedRect.height,
   }
 }
 
@@ -2235,22 +2433,39 @@ function updateLocalCrosshairFromEvent(e: MouseEvent) {
   if (!container) return
 
   const rect = container.getBoundingClientRect()
-  if (rect.width <= 0 || rect.height <= 0) return
+  const bounds = getLocalRenderedVideoBounds()
+  if (rect.width <= 0 || rect.height <= 0 || !bounds) return
 
   if (mouseMode.value === 'relative' && isPointerLocked.value) {
-    const cur = localCrosshairPos.value
-    const nx = cur ? cur.x + e.movementX : rect.width / 2
-    const ny = cur ? cur.y + e.movementY : rect.height / 2
-    localCrosshairPos.value = {
-      x: Math.max(0, Math.min(rect.width, nx)),
-      y: Math.max(0, Math.min(rect.height, ny)),
-    }
+    updateLocalCrosshairByDelta(e.movementX, e.movementY)
     return
   }
 
   localCrosshairPos.value = {
-    x: Math.max(0, Math.min(rect.width, e.clientX - rect.left)),
-    y: Math.max(0, Math.min(rect.height, e.clientY - rect.top)),
+    x: Math.max(bounds.left, Math.min(bounds.right, e.clientX - rect.left)),
+    y: Math.max(bounds.top, Math.min(bounds.bottom, e.clientY - rect.top)),
+  }
+}
+
+function updateLocalCrosshairByDelta(dx: number, dy: number) {
+  if (!cursorVisible.value) {
+    localCrosshairPos.value = null
+    return
+  }
+
+  const container = videoContainerRef.value
+  if (!container) return
+
+  const bounds = getLocalRenderedVideoBounds()
+  if (!bounds) return
+
+  const current = localCrosshairPos.value ?? {
+    x: (bounds.left + bounds.right) / 2,
+    y: (bounds.top + bounds.bottom) / 2,
+  }
+  localCrosshairPos.value = {
+    x: Math.max(bounds.left, Math.min(bounds.right, current.x + dx)),
+    y: Math.max(bounds.top, Math.min(bounds.bottom, current.y + dy)),
   }
 }
 
@@ -2258,6 +2473,259 @@ function handleMouseLeaveVideo() {
   if (!isPointerLocked.value) {
     localCrosshairPos.value = null
   }
+}
+
+function sendTouchClick(button: 'left' | 'right') {
+  flushPendingMouseMovesImmediately()
+  sendMouseEvent({ type: 'down', button })
+  sendMouseEvent({ type: 'up', button })
+}
+
+function clearPendingTouchTap(commitRelativeClick = false) {
+  const tap = pendingTouchTap
+  pendingTouchTap = null
+
+  if (!tap) return
+  if (tap.timer !== null) {
+    clearTimeout(tap.timer)
+  }
+  if (commitRelativeClick && tap.mode === 'relative') {
+    sendTouchClick('left')
+  }
+}
+
+function schedulePendingTouchTap(mode: 'absolute' | 'relative', x: number, y: number) {
+  const tap: PendingTouchTap = {
+    mode,
+    x,
+    y,
+    timestamp: Date.now(),
+    timer: null,
+  }
+  tap.timer = setTimeout(() => {
+    if (pendingTouchTap === tap) {
+      clearPendingTouchTap(true)
+    }
+  }, TOUCH_DOUBLE_TAP_MS)
+  pendingTouchTap = tap
+}
+
+function clearTouchPointer() {
+  const activePointer = touchPointer
+  touchPointer = null
+
+  if (!activePointer) return
+  if (activePointer.longPressTimer !== null) {
+    clearTimeout(activePointer.longPressTimer)
+  }
+
+  const container = videoContainerRef.value
+  if (container) {
+    try {
+      if (container.hasPointerCapture(activePointer.pointerId)) {
+        container.releasePointerCapture(activePointer.pointerId)
+      }
+    } catch {
+      // Pointer capture may already have been released by the browser.
+    }
+  }
+
+  if (activePointer.leftButtonDown) {
+    flushPendingMouseMovesImmediately()
+    sendMouseEvent({ type: 'up', button: 'left' })
+  }
+}
+
+function resetTouchInput() {
+  clearTouchPointer()
+  clearPendingTouchTap(false)
+}
+
+function sendAbsoluteTouchPosition(e: PointerEvent, immediate = false) {
+  const absolutePosition = getAbsoluteMousePosition(e)
+  if (!absolutePosition) return
+
+  mousePosition.value = absolutePosition
+  updateLocalCrosshairFromEvent(e)
+
+  if (immediate) {
+    sendMouseEvent({ type: 'move_abs', ...absolutePosition })
+    pendingMouseMove = null
+    return
+  }
+
+  pendingMouseMove = { type: 'move_abs', ...absolutePosition }
+  requestMouseMoveFlush()
+}
+
+function handleTouchPointerDown(e: PointerEvent) {
+  if (e.pointerType !== 'touch') return
+
+  e.preventDefault()
+
+  const container = videoContainerRef.value
+  if (!container || touchPointer !== null) return
+
+  if (document.activeElement !== container) {
+    container.focus()
+  }
+
+  const previousTap = pendingTouchTap
+  const now = Date.now()
+  const doubleTapDistanceX = previousTap ? e.clientX - previousTap.x : 0
+  const doubleTapDistanceY = previousTap ? e.clientY - previousTap.y : 0
+  const doubleTapCandidate = !!previousTap
+    && previousTap.mode === mouseMode.value
+    && now - previousTap.timestamp <= TOUCH_DOUBLE_TAP_MS
+    && doubleTapDistanceX * doubleTapDistanceX + doubleTapDistanceY * doubleTapDistanceY
+      <= TOUCH_DOUBLE_TAP_DISTANCE_PX ** 2
+
+  clearPendingTouchTap(!doubleTapCandidate)
+
+  const activePointer: TouchPointerState = {
+    pointerId: e.pointerId,
+    mode: mouseMode.value,
+    startX: e.clientX,
+    startY: e.clientY,
+    lastX: e.clientX,
+    lastY: e.clientY,
+    maxDistanceSquared: 0,
+    longPressTimer: null,
+    leftButtonDown: false,
+    doubleTapCandidate,
+  }
+  touchPointer = activePointer
+
+  if (activePointer.mode === 'absolute') {
+    sendAbsoluteTouchPosition(e, true)
+  }
+
+  activePointer.longPressTimer = setTimeout(() => {
+    if (
+      touchPointer !== activePointer
+      || mouseMode.value !== activePointer.mode
+      || activePointer.maxDistanceSquared > TOUCH_TAP_MOVE_THRESHOLD_PX ** 2
+    ) return
+
+    if (activePointer.doubleTapCandidate) {
+      activePointer.doubleTapCandidate = false
+      if (activePointer.mode === 'relative') {
+        sendTouchClick('left')
+      }
+    }
+    flushPendingMouseMovesImmediately()
+    activePointer.leftButtonDown = true
+    sendMouseEvent({ type: 'down', button: 'left' })
+  }, TOUCH_LONG_PRESS_MS)
+
+  try {
+    container.setPointerCapture(e.pointerId)
+  } catch {
+    // The gesture can still be handled while it remains inside the video area.
+  }
+}
+
+function handleTouchPointerMove(e: PointerEvent) {
+  const activePointer = touchPointer
+  if (
+    e.pointerType !== 'touch'
+    || !activePointer
+    || activePointer.pointerId !== e.pointerId
+    || mouseMode.value !== activePointer.mode
+  ) return
+
+  e.preventDefault()
+
+  const distanceX = e.clientX - activePointer.startX
+  const distanceY = e.clientY - activePointer.startY
+  const previousMaxDistanceSquared = activePointer.maxDistanceSquared
+  activePointer.maxDistanceSquared = Math.max(
+    activePointer.maxDistanceSquared,
+    distanceX * distanceX + distanceY * distanceY,
+  )
+
+  if (
+    previousMaxDistanceSquared <= TOUCH_TAP_MOVE_THRESHOLD_PX ** 2
+    && activePointer.maxDistanceSquared > TOUCH_TAP_MOVE_THRESHOLD_PX ** 2
+  ) {
+    if (activePointer.longPressTimer !== null) {
+      clearTimeout(activePointer.longPressTimer)
+      activePointer.longPressTimer = null
+    }
+    if (activePointer.doubleTapCandidate) {
+      activePointer.doubleTapCandidate = false
+      if (activePointer.mode === 'relative') {
+        sendTouchClick('left')
+      }
+    }
+  }
+
+  if (activePointer.mode === 'absolute') {
+    sendAbsoluteTouchPosition(e)
+    return
+  }
+
+  // Keep sub-pixel movement as a remainder instead of losing it on every event.
+  const dx = Math.trunc(e.clientX - activePointer.lastX)
+  const dy = Math.trunc(e.clientY - activePointer.lastY)
+  if (dx === 0 && dy === 0) return
+
+  activePointer.lastX += dx
+  activePointer.lastY += dy
+  const rotatedDelta = rotateRelativeDelta(dx, dy)
+  accumulatedDelta.x += rotatedDelta.dx
+  accumulatedDelta.y += rotatedDelta.dy
+  mousePosition.value = {
+    x: mousePosition.value.x + rotatedDelta.dx,
+    y: mousePosition.value.y + rotatedDelta.dy,
+  }
+  updateLocalCrosshairByDelta(dx, dy)
+  requestMouseMoveFlush()
+}
+
+function registerTouchTap(activePointer: TouchPointerState) {
+  if (activePointer.doubleTapCandidate) {
+    sendTouchClick('right')
+    return
+  }
+
+  schedulePendingTouchTap(activePointer.mode, activePointer.startX, activePointer.startY)
+}
+
+function finishTouchPointer(e: PointerEvent, allowTap: boolean) {
+  const activePointer = touchPointer
+  if (e.pointerType !== 'touch' || !activePointer || activePointer.pointerId !== e.pointerId) return
+
+  e.preventDefault()
+
+  if (allowTap && mouseMode.value === activePointer.mode) {
+    handleTouchPointerMove(e)
+  }
+
+  const isTap = allowTap
+    && mouseMode.value === activePointer.mode
+    && !activePointer.leftButtonDown
+    && activePointer.maxDistanceSquared <= TOUCH_TAP_MOVE_THRESHOLD_PX ** 2
+  const wasDragging = activePointer.leftButtonDown
+
+  if (!allowTap && activePointer.doubleTapCandidate && activePointer.mode === 'relative') {
+    activePointer.doubleTapCandidate = false
+    sendTouchClick('left')
+  }
+
+  clearTouchPointer()
+
+  if (!wasDragging && isTap) {
+    registerTouchTap(activePointer)
+  }
+}
+
+function handleTouchPointerUp(e: PointerEvent) {
+  finishTouchPointer(e, true)
+}
+
+function handleTouchPointerCancel(e: PointerEvent) {
+  finishTouchPointer(e, false)
 }
 
 function handleMouseMove(e: MouseEvent) {
@@ -2280,14 +2748,16 @@ function handleMouseMove(e: MouseEvent) {
       const dy = e.movementY
 
       if (dx !== 0 || dy !== 0) {
-        accumulatedDelta.x += dx
-        accumulatedDelta.y += dy
+        const rotatedDelta = rotateRelativeDelta(dx, dy)
+        accumulatedDelta.x += rotatedDelta.dx
+        accumulatedDelta.y += rotatedDelta.dy
         requestMouseMoveFlush()
       }
 
+      const rotatedDelta = rotateRelativeDelta(dx, dy)
       mousePosition.value = {
-        x: mousePosition.value.x + dx,
-        y: mousePosition.value.y + dy,
+        x: mousePosition.value.x + rotatedDelta.dx,
+        y: mousePosition.value.y + rotatedDelta.dy,
       }
     }
   }
@@ -2365,6 +2835,21 @@ function requestMouseMoveFlush() {
   }
 
   scheduleMouseMoveFlush()
+}
+
+function flushPendingMouseMovesImmediately() {
+  if (mouseFlushTimer !== null) {
+    clearTimeout(mouseFlushTimer)
+    mouseFlushTimer = null
+  }
+
+  let sent = false
+  while (flushMouseMoveOnce()) {
+    sent = true
+  }
+  if (sent) {
+    lastMouseMoveSendTime = Date.now()
+  }
 }
 
 const pressedMouseButton = ref<'left' | 'right' | 'middle' | null>(null)
@@ -2459,9 +2944,12 @@ function handlePointerLockChange() {
   if (isPointerLocked.value) {
     mousePosition.value = { x: 0, y: 0 }
     if (cursorVisible.value && container) {
-      const r = container.getBoundingClientRect()
-      if (r.width > 0 && r.height > 0) {
-        localCrosshairPos.value = { x: r.width / 2, y: r.height / 2 }
+      const bounds = getLocalRenderedVideoBounds()
+      if (bounds) {
+        localCrosshairPos.value = {
+          x: (bounds.left + bounds.right) / 2,
+          y: (bounds.top + bounds.bottom) / 2,
+        }
       }
     }
   }
@@ -2476,6 +2964,7 @@ function handleFullscreenChange() {
 }
 
 function handleBlur() {
+  resetTouchInput()
   pressedKeys.value = []
   activeModifierMask.value = 0
   if (pressedMouseButton.value !== null) {
@@ -2595,6 +3084,7 @@ async function activateConsoleView() {
 
 function deactivateConsoleView() {
   isConsoleActive.value = false
+  void microphone.stop()
   handleBlur()
   exitPointerLock()
   unregisterInteractionListeners()
@@ -2616,11 +3106,13 @@ function handleVirtualKeyUp(key: CanonicalKey) {
 }
 
 function handleToggleMouseMode() {
+  resetTouchInput()
+
   if (mouseMode.value === 'relative' && isPointerLocked.value) {
     exitPointerLock()
   }
 
-  mouseMode.value = mouseMode.value === 'absolute' ? 'relative' : 'absolute'
+  mouseMode.value = configStore.hid?.backend === 'bluetooth' ? 'relative' : (mouseMode.value === 'absolute' ? 'relative' : 'absolute')
   pendingMouseMove = null
   accumulatedDelta = { x: 0, y: 0 }
   lastMousePosition.value = { x: 0, y: 0 }
@@ -2630,7 +3122,22 @@ function handleToggleMouseMode() {
   }
 }
 
+async function refreshUacAvailability() {
+  try {
+    const uacConfig = await uacApi.get()
+    uacEnabled.value = uacConfig.enabled
+  } catch {
+    uacEnabled.value = false
+  }
+}
+
+watch(microphoneTransferEnabled, enabled => {
+  if (!enabled) void microphone.stop()
+})
+
 onMounted(async () => {
+  await refreshUacAvailability()
+
   consoleEvents.subscribe()
 
   watch([wsConnected, wsNetworkError], ([connected, netError], [_prevConnected, prevNetError]) => {
@@ -2646,6 +3153,10 @@ onMounted(async () => {
   }, { immediate: true })
 
   await systemStore.startStream().catch(() => {})
+  const initialStreamStatus = await streamApi.status().catch(() => null)
+  if (initialStreamStatus) {
+    handleStreamStateChanged(initialStreamStatus)
+  }
   await systemStore.fetchSystemInfo().catch(() => {})
   await systemStore.fetchAllStates()
   await configStore.refreshHid().then(() => {
@@ -2657,12 +3168,6 @@ onMounted(async () => {
   watch(() => configStore.hid?.mouse_absolute, () => {
     syncMouseModeFromConfig()
   })
-
-  const storedTheme = localStorage.getItem('theme')
-  if (storedTheme === 'dark' || (!storedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-    isDark.value = true
-    document.documentElement.classList.add('dark')
-  }
 
   try {
     const modeResp = await streamApi.getMode()
@@ -2676,6 +3181,7 @@ onMounted(async () => {
 })
 
 onActivated(() => {
+  void refreshUacAvailability()
   void activateConsoleView()
 })
 
@@ -2720,17 +3226,22 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="h-screen h-dvh flex flex-col bg-background">
-    <header class="shrink-0 border-b border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
+  <div class="relative h-screen h-dvh flex flex-col bg-background">
+    <header class="shrink-0 border-b bg-background" :class="consoleLayout === 'floating' && 'console-header--floating'">
       <div class="px-2 sm:px-4">
-        <div class="h-10 sm:h-14 flex items-center justify-between">
-          <div class="flex items-center gap-2 sm:gap-6">
-            <div class="flex items-center gap-1.5 sm:gap-2">
+        <div class="console-header__row h-10 sm:h-14 flex items-center justify-between">
+          <div class="flex min-w-0 flex-1 items-center gap-2 sm:gap-6">
+            <div class="flex shrink-0 items-center gap-1.5 whitespace-nowrap sm:gap-2">
               <BrandMark size="md" class="hidden sm:block" />
               <BrandMark size="sm" class="sm:hidden" />
               <span class="font-bold text-sm sm:text-lg">One-KVM</span>
             </div>
-            <div class="flex md:hidden items-center gap-1">
+            <ConsoleStatusSummary
+              v-if="consoleLayout !== 'current'"
+              :items="consoleStatusItems"
+              :show-video-info="consoleLayout === 'sidebar'"
+            />
+            <div v-else class="flex md:hidden items-center gap-1">
               <StatusCard
                 :title="t('statusCard.video')"
                 type="video"
@@ -2752,8 +3263,18 @@ onUnmounted(() => {
               />
             </div>
           </div>
-          <div class="flex items-center gap-1 sm:gap-2">
-            <div class="hidden md:flex items-center gap-2">
+          <div class="console-header__account flex shrink-0 items-center gap-1 sm:gap-2">
+            <ConsoleHeaderActions
+              v-if="consoleLayout === 'floating'"
+              :show-stats="showConnectionStats"
+              :show-terminal="showTerminal"
+              :terminal-running="!!ttydStatus?.running"
+              :show-computer-use="showComputerUse"
+              @open-stats="openStatsSheet"
+              @open-terminal="openTerminal"
+              @open-computer-use="openComputerUse"
+            />
+            <div v-if="consoleLayout === 'current'" class="hidden md:flex items-center gap-2">
               <StatusCard
                 :title="t('statusCard.video')"
                 type="video"
@@ -2763,7 +3284,6 @@ onUnmounted(() => {
                 :details="videoDetails"
               />
               <StatusCard
-                v-if="systemStore.audio?.available"
                 :title="t('statusCard.audio')"
                 type="audio"
                 :status="audioStatus"
@@ -2791,23 +3311,23 @@ onUnmounted(() => {
                 hover-align="end"
               />
             </div>
-            <div class="h-6 w-px bg-slate-200 dark:bg-slate-700 hidden md:block mx-1" />
-            <Button variant="ghost" size="icon" class="h-8 w-8 hidden md:flex" :aria-label="t('common.toggleTheme')" @click="toggleTheme">
-              <Sun v-if="isDark" class="h-4 w-4" />
-              <Moon v-else class="h-4 w-4" />
+            <div class="mx-1 hidden h-6 w-px bg-border md:block" />
+            <Button variant="ghost" size="icon-sm" class="hidden md:flex" :aria-label="t('common.toggleTheme')" @click="toggleTheme">
+              <Sun v-if="isDark" class="size-4" />
+              <Moon v-else class="size-4" />
             </Button>
-            <LanguageToggleButton class="h-8 w-8 hidden md:flex" />
+            <LanguageToggleButton class="size-8 hidden md:flex" />
             <DropdownMenu>
               <DropdownMenuTrigger as-child>
-                <Button variant="outline" size="sm" class="gap-1 sm:gap-1.5 h-7 sm:h-9 px-2 sm:px-3">
+                <Button variant="outline" size="sm" class="gap-1 sm:gap-1.5 px-2 sm:px-3">
                   <span class="text-xs max-w-[60px] sm:max-w-[100px] truncate">{{ authStore.user || 'admin' }}</span>
-                  <ChevronDown class="h-3 w-3 sm:h-3.5 sm:w-3.5" />
+                  <ChevronDown class="size-3 sm:size-3.5" />
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 <DropdownMenuItem class="md:hidden" @click="toggleTheme">
-                  <Sun v-if="isDark" class="h-4 w-4 mr-2" />
-                  <Moon v-else class="h-4 w-4 mr-2" />
+                  <Sun v-if="isDark" class="size-4 mr-2" />
+                  <Moon v-else class="size-4 mr-2" />
                   {{ isDark ? t('settings.lightMode') : t('settings.darkMode') }}
                 </DropdownMenuItem>
                 <DropdownMenuItem as-child class="md:hidden p-0">
@@ -2820,12 +3340,12 @@ onUnmounted(() => {
                 </DropdownMenuItem>
                 <DropdownMenuSeparator class="md:hidden" />
                 <DropdownMenuItem @click="changePasswordDialogOpen = true">
-                  <KeyRound class="h-4 w-4 mr-2" />
+                  <KeyRound class="size-4 mr-2" />
                   {{ t('auth.changePassword') }}
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem @click="logout">
-                  <LogOut class="h-4 w-4 mr-2" />
+                  <LogOut class="size-4 mr-2" />
                   {{ t('auth.logout') }}
                 </DropdownMenuItem>
               </DropdownMenuContent>
@@ -2834,74 +3354,101 @@ onUnmounted(() => {
         </div>
       </div>
     </header>
-    <ActionBar
-      :mouse-mode="mouseMode"
-      :video-mode="videoMode"
-      :ttyd-running="ttydStatus?.running"
-      :show-terminal="showTerminal"
-      :show-computer-use="showComputerUse"
-      @toggle-fullscreen="toggleFullscreen"
-      @toggle-stats="openStatsSheet"
-      @toggle-virtual-keyboard="handleToggleVirtualKeyboard"
-      @toggle-mouse-mode="handleToggleMouseMode"
-      @update:video-mode="handleVideoModeChange"
-      @power-short="handlePowerShort"
-      @power-long="handlePowerLong"
-      @reset="handleReset"
-      @wol="handleWol"
-      @open-terminal="openTerminal"
-      @open-computer-use="openComputerUse"
-    />
-    <div class="flex-1 overflow-hidden relative">
-      <div
-        class="absolute inset-0 bg-slate-100/80 dark:bg-slate-800/40 opacity-80"
-        style="
-          background-image: radial-gradient(circle, rgb(148 163 184 / 0.4) 1px, transparent 1px);
-          background-size: 20px 20px;
-        "
+    <div
+      class="console-actionbar-host"
+      :class="`console-actionbar-host--${consoleLayout}`"
+    >
+      <ActionBar
+        :layout="consoleLayout"
+        :mouse-mode="mouseMode"
+        :video-mode="videoMode"
+        :video-rotation="videoRotation"
+        :ttyd-running="ttydStatus?.running"
+        :show-power="showPower"
+        :atx-enabled="systemStore.atx?.available === true"
+        :show-terminal="showTerminal"
+        :show-computer-use="showComputerUse"
+        :show-paste-text="showPasteText"
+        :show-mic="microphoneTransferEnabled"
+        :scale-mode="videoScaleMode"
+        :source-size-available="sourceSizeAvailable"
+        @toggle-fullscreen="toggleFullscreen"
+        @update:scale-mode="setVideoScaleMode"
+        @toggle-stats="openStatsSheet"
+        @toggle-virtual-keyboard="handleToggleVirtualKeyboard"
+        @toggle-mouse-mode="handleToggleMouseMode"
+        @update:video-mode="handleVideoModeChange"
+        @update:video-rotation="setVideoRotation"
+        @power-short="handlePowerShort"
+        @power-long="handlePowerLong"
+        @reset="handleReset"
+        @wol="handleWol"
+        @open-terminal="openTerminal"
+        @open-computer-use="openComputerUse"
       />
+    </div>
+    <div
+      class="flex-1 overflow-hidden relative transition-[padding] duration-300"
+      :class="consoleLayout === 'sidebar' && 'pl-14 sm:pl-16'"
+    >
+      <div class="absolute inset-0 dot-grid-bg" />
       <div class="relative flex h-full w-full min-w-0 items-stretch gap-3 p-1 sm:p-4">
         <div
           class="flex min-w-0 flex-1 items-center justify-center transition-all duration-300"
           :class="{ 'md:pr-1': computerUsePanelVisible }"
         >
         <div
-          ref="videoContainerRef"
-          class="relative bg-black overflow-hidden flex items-center justify-center"
-          :style="videoContainerStyle"
-          :class="{
-            'cursor-none': true,
-          }"
-          tabindex="0"
-          @mouseleave="handleMouseLeaveVideo"
-          @mousemove="handleMouseMove"
-          @mousedown="handleMouseDown"
-          @mouseup="handleMouseUp"
-          @wheel.prevent="handleWheel"
-          @contextmenu="handleContextMenu"
+          ref="videoWorkspaceRef"
+          class="video-workspace relative h-full w-full min-h-[120px] overflow-auto fullscreen:bg-black"
         >
-          <img
-            v-show="videoMode === 'mjpeg'"
-            ref="videoRef"
-            :src="mjpegUrl"
-            class="w-full h-full object-contain"
-            :alt="t('console.videoAlt')"
-            @load="handleVideoLoad"
-            @error="handleVideoError"
-          />
-          <video
-            v-show="videoMode !== 'mjpeg'"
-            ref="webrtcVideoRef"
-            class="w-full h-full object-contain"
-            autoplay
-            playsinline
-          />
-          <img
-            v-if="frameOverlayUrl"
-            :src="frameOverlayUrl"
-            class="absolute inset-0 w-full h-full object-contain pointer-events-none"
-            alt=""
-          />
+          <div
+            class="relative grid place-items-center"
+            :class="videoStageClass"
+          >
+            <div
+              ref="videoContainerRef"
+              class="relative flex shrink-0 cursor-none items-center justify-center overflow-hidden bg-black touch-none"
+              :style="videoContainerStyle"
+              tabindex="0"
+              @mouseleave="handleMouseLeaveVideo"
+              @pointerdown="handleTouchPointerDown"
+              @pointermove="handleTouchPointerMove"
+              @pointerup="handleTouchPointerUp"
+              @pointercancel="handleTouchPointerCancel"
+              @mousemove="handleMouseMove"
+              @mousedown="handleMouseDown"
+              @mouseup="handleMouseUp"
+              @wheel.prevent="handleWheel"
+              @contextmenu="handleContextMenu"
+            >
+              <div class="relative shrink-0" :style="videoContentStyle">
+                <img
+                  v-show="videoMode === 'mjpeg'"
+                  ref="videoRef"
+                  :src="mjpegUrl"
+                  class="size-full object-contain pointer-events-none select-none"
+                  :alt="t('console.videoAlt')"
+                  draggable="false"
+                  @load="handleVideoLoad"
+                  @error="handleVideoError"
+                />
+                <video
+                  v-show="videoMode !== 'mjpeg'"
+                  ref="webrtcVideoRef"
+                  class="size-full object-contain pointer-events-none"
+                  autoplay
+                  playsinline
+                  @loadedmetadata="handleWebRTCVideoResize"
+                  @loadeddata="handleWebRTCVideoResize"
+                  @resize="handleWebRTCVideoResize"
+                />
+                <img
+                  v-if="frameOverlayUrl"
+                  :src="frameOverlayUrl"
+                  class="absolute inset-0 size-full object-contain pointer-events-none"
+                  alt=""
+                />
+              </div>
           <div
             v-if="cursorVisible && localCrosshairPos"
             class="pointer-events-none absolute z-[15] -translate-x-1/2 -translate-y-1/2"
@@ -2955,14 +3502,14 @@ onUnmounted(() => {
           </div>
           <Transition name="fade">
             <div
-              v-if="videoLoading"
+              v-if="videoLoading && !showSignalOverlay && !videoError"
               class="absolute inset-0 flex flex-col items-center justify-center bg-black/70 backdrop-blur-sm transition-opacity duration-300"
             >
               <div class="absolute inset-0 overflow-hidden pointer-events-none">
                 <div class="absolute w-full h-0.5 bg-gradient-to-r from-transparent via-primary/40 to-transparent animate-pulse" style="top: 50%; animation-duration: 1.5s;" />
               </div>
 
-              <Spinner class="h-10 w-10 sm:h-16 sm:w-16 text-white mb-2 sm:mb-4" />
+              <Spinner class="size-10 sm:size-16 text-white mb-2 sm:mb-4" />
               <p class="text-white/90 text-sm sm:text-lg font-medium text-center px-4 flex items-baseline justify-center gap-2 flex-wrap">
                 <span>{{ webrtcLoadingMessage }}</span>
                 <span
@@ -3000,7 +3547,7 @@ onUnmounted(() => {
           </Transition>
           <Transition name="fade">
             <div
-              v-if="showSignalOverlay && !videoLoading && !videoError"
+              v-if="showSignalOverlay && !videoError"
               class="absolute inset-0 flex flex-col items-center justify-center gap-3 p-4 transition-opacity duration-300 pointer-events-none"
               :class="{
                 'bg-black/80 backdrop-blur-sm': signalOverlayInfo.tone === 'error',
@@ -3008,7 +3555,7 @@ onUnmounted(() => {
               }"
             >
               <MonitorOff
-                class="h-10 w-10 sm:h-16 sm:w-16"
+                class="size-10 sm:size-16"
                 :class="{
                   'text-slate-200': signalOverlayInfo.tone === 'info',
                   'text-red-300': signalOverlayInfo.tone === 'error',
@@ -3037,7 +3584,7 @@ onUnmounted(() => {
               v-if="videoError && !videoLoading"
               class="absolute inset-0 flex flex-col items-center justify-center bg-black/85 text-white gap-4 transition-opacity duration-300 p-4"
             >
-              <MonitorOff class="h-10 w-10 sm:h-16 sm:w-16 text-slate-400" />
+              <MonitorOff class="size-10 sm:size-16 text-slate-400" />
               <div class="text-center max-w-md px-2">
                 <p class="font-medium text-sm sm:text-lg mb-1 sm:mb-2">{{ t('console.connectionFailed') }}</p>
                 <p class="text-xs sm:text-sm text-slate-300 mb-2 sm:mb-3">{{ t('console.connectionFailedDesc') }}</p>
@@ -3048,12 +3595,14 @@ onUnmounted(() => {
               </div>
               <div class="flex gap-2">
                 <Button variant="secondary" size="sm" @click="reloadPage">
-                  <RefreshCw class="h-4 w-4 mr-2" />
+                  <RefreshCw class="size-4 mr-2" />
                   {{ t('console.reconnect') }}
                 </Button>
               </div>
             </div>
           </Transition>
+            </div>
+          </div>
         </div>
         </div>
         <ComputerUseSheet
@@ -3083,6 +3632,13 @@ onUnmounted(() => {
     </Teleport>
     <div id="keyboard-anchor"></div>
     <InfoBar
+      v-if="consoleLayout !== 'floating' || pressedKeys.length > 0 || isPointerLocked"
+      :compact="consoleLayout !== 'current'"
+      :captured="isPointerLocked"
+      :minimal="consoleLayout === 'floating'"
+      :class="consoleLayout === 'floating'
+        ? 'pointer-events-none absolute bottom-2 left-1/2 z-30 max-w-[calc(100%-1rem)] -translate-x-1/2 rounded-lg border shadow-sm !w-auto'
+        : 'shrink-0'"
       :pressed-keys="pressedKeys"
       :caps-lock="keyboardLed.capsLock"
       :num-lock="keyboardLed.numLock"
@@ -3139,7 +3695,7 @@ onUnmounted(() => {
             {{ t('common.cancel') }}
           </Button>
           <Button @click="handleChangePassword" :disabled="changingPassword">
-            <Loader2 v-if="changingPassword" class="h-4 w-4 mr-2 animate-spin" />
+            <Loader2 v-if="changingPassword" class="size-4 mr-2 animate-spin" />
             {{ t('common.confirm') }}
           </Button>
         </DialogFooter>
@@ -3150,6 +3706,69 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* Keep the action bar in one DOM location while changing only its placement.
+   Moving a live Teleport target during a layout switch can leave stale portal
+   nodes behind when the target is conditionally rendered. */
+.console-actionbar-host {
+  position: relative;
+  z-index: 40;
+}
+
+.console-actionbar-host--floating {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.console-actionbar-host--floating :deep(.console-action-bar) {
+  pointer-events: auto;
+}
+
+.console-actionbar-host--sidebar :deep(.console-action-bar--sidebar) {
+  position: relative;
+  inset: auto;
+  width: 100%;
+  height: 100%;
+}
+
+.console-actionbar-host--sidebar {
+  position: absolute;
+  inset: 3.5rem auto 1.75rem 0;
+  width: 4rem;
+}
+
+@media (max-width: 639px) {
+  .console-actionbar-host--sidebar {
+    inset: 2.5rem auto 1.75rem 0;
+    width: 3.5rem;
+  }
+}
+
+/* Expanded controls may overlap header actions, but stay outside the video stage. */
+.console-header--floating .console-header__row {
+  position: relative;
+  height: 60px;
+}
+.console-header__toolbar {
+  position: absolute;
+  z-index: 40;
+  top: 50%;
+  left: 50%;
+  width: 100%;
+  max-width: 64rem;
+  transform: translate(-50%, -50%);
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+.console-header__toolbar :deep(.console-action-bar) {
+  pointer-events: auto;
+}
+
 .fade-enter-active,
 .fade-leave-active {
   transition: opacity 0.3s ease;
@@ -3158,5 +3777,10 @@ onUnmounted(() => {
 .fade-enter-from,
 .fade-leave-to {
   opacity: 0;
+}
+
+.video-workspace:fullscreen {
+  width: 100vw;
+  height: 100vh;
 }
 </style>

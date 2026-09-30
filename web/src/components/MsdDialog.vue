@@ -3,8 +3,8 @@ import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { toast } from 'vue-sonner'
 import { useSystemStore } from '@/stores/system'
-import { msdApi, type MsdImage, type DriveFile } from '@/api'
-import { ApiError } from '@/api/request'
+import { msdApi, type MsdImage, type DriveFile, type DriveInfo, type MountedMedia, type DiskMode } from '@/api'
+import { ApiError, localizeMsdErrorCode } from '@/api/request'
 import { useWebSocket } from '@/composables/useWebSocket'
 import {
   Dialog,
@@ -29,6 +29,8 @@ import { Label } from '@/components/ui/label'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { Slider } from '@/components/ui/slider'
 import { Separator } from '@/components/ui/separator'
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia } from '@/components/ui/empty'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   HardDrive,
   Upload,
@@ -48,7 +50,6 @@ import {
   AlertCircle,
   Info,
 } from 'lucide-vue-next'
-import HelpTooltip from '@/components/HelpTooltip.vue'
 
 const props = defineProps<{
   open: boolean
@@ -63,11 +64,16 @@ const systemStore = useSystemStore()
 const { on, off } = useWebSocket()
 
 const activeTab = ref('images')
+const msdStatusError = ref<string | null>(null)
 
 const images = ref<MsdImage[]>([])
 const loadingImages = ref(false)
+const imagesError = ref<string | null>(null)
 const uploadProgress = ref(0)
 const uploading = ref(false)
+const uploadProgressPercent = computed(() =>
+  Math.round(Math.min(100, Math.max(0, uploadProgress.value))),
+)
 
 const mountMode = ref<'cdrom' | 'flash'>('flash')
 // Default to readwrite for flash mode; cdrom forces readonly anyway
@@ -77,17 +83,21 @@ const cdromMode = computed(() => mountMode.value === 'cdrom')
 const readOnly = computed(() => accessMode.value === 'readonly')
 
 const connecting = ref(false)
-const disconnecting = ref(false)
 const deleting = ref(false)
+const modeChanging = ref(false)
+const unmountingMediaId = ref<string | null>(null)
+const pendingMountImage = ref<MsdImage | null>(null)
+const showMountOptionsDialog = ref(false)
 
 const driveFiles = ref<DriveFile[]>([])
 const currentPath = ref('/')
 const loadingDrive = ref(false)
-const driveInfo = ref<{ size: number; used: number; free: number; initialized: boolean } | null>(null)
+const driveInfo = ref<DriveInfo | null>(null)
 const driveInitialized = ref(false)
 const uploadingFile = ref(false)
 const fileUploadProgress = ref(0)
 const driveError = ref<string | null>(null) // filesystem error (e.g. unsupported format)
+const driveErrorCode = ref<string | null>(null)
 
 const showDeleteDialog = ref(false)
 const deleteTarget = ref<{ type: 'image' | 'file'; id: string; name: string } | null>(null)
@@ -146,29 +156,73 @@ const downloadProgress = ref<{
   total_bytes: number | null
   progress_pct: number | null
   status: string
+  error_code: string | null
 } | null>(null)
+const downloadFailureNotifiedId = ref<string | null>(null)
 
 const TWO_POINT_TWO_GB = 2.2 * 1024 * 1024 * 1024
+const tabTriggerClass = 'h-8 rounded-md border-0 bg-transparent text-center text-muted-foreground shadow-none hover:text-foreground data-[state=active]:border-0 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm'
+const segmentedGroupClass = 'grid w-full grid-cols-2 items-center gap-1 rounded-md border border-border bg-muted p-0.5'
+const segmentedItemClass = 'h-8 w-full justify-center rounded-md border-0 bg-transparent px-3 text-center text-xs text-muted-foreground shadow-none hover:bg-transparent hover:text-foreground data-[state=on]:border-0 data-[state=on]:bg-background data-[state=on]:text-foreground data-[state=on]:shadow-sm data-[state=on]:hover:bg-background'
 
-const msdConnected = computed(() => systemStore.msd?.connected ?? false)
-const msdMode = computed(() => systemStore.msd?.mode ?? 'none')
+const diskMode = computed(() => systemStore.msd?.diskMode ?? 'single')
+const slotCapacity = computed(() => systemStore.msd?.slotCapacity ?? 1)
+const mountedMedia = computed<MountedMedia[]>(() => systemStore.msd?.mountedMedia ?? [])
+const mountedCount = computed(() => systemStore.msd?.mountedCount ?? mountedMedia.value.length)
+const msdConnected = computed(() => mountedCount.value > 0)
+const mediaSlotsFull = computed(() => mountedCount.value >= slotCapacity.value)
+const driveMedia = computed(() => mountedMedia.value.find(media => media.kind === 'drive') ?? null)
 // Drive is currently mounted on the target machine via USB — file ops are blocked
-const driveConnectedToTarget = computed(() => msdConnected.value && msdMode.value === 'drive')
+const driveConnectedToTarget = computed(() => !!driveMedia.value)
+const driveFileAccess = computed(() => {
+  if (driveConnectedToTarget.value) return 'blocked_while_connected'
+  return driveInfo.value?.file_access ?? 'unknown'
+})
+const driveFilesAvailable = computed(() => driveFileAccess.value === 'available')
+const driveFilesystemUnsupported = computed(() =>
+  driveFileAccess.value === 'unsupported' || driveErrorCode.value === 'MSD_DRIVE_FILESYSTEM_UNSUPPORTED',
+)
 
 
 
 const operationInProgress = computed(() => {
   return connecting.value ||
-         disconnecting.value ||
          deleting.value ||
          uploading.value ||
          uploadingFile.value ||
          initializingDrive.value ||
-         deletingDrive.value
+         deletingDrive.value ||
+         modeChanging.value ||
+         !!unmountingMediaId.value
 })
+
+const usbReenumerating = computed(() => systemStore.msd?.usbReenumerating || modeChanging.value)
 
 function isLargeFile(image: MsdImage): boolean {
   return image.size > TWO_POINT_TWO_GB
+}
+
+function isIsoImage(image: MsdImage): boolean {
+  return image.name.toLowerCase().endsWith('.iso')
+}
+
+function mountedImage(imageId: string): MountedMedia | null {
+  return mountedMedia.value.find(media => media.kind === 'image' && media.id === imageId) ?? null
+}
+
+function updateMountMode(value: unknown) {
+  const next = Array.isArray(value) ? value[0] : value
+  if (next !== 'cdrom' && next !== 'flash') return
+  mountMode.value = next
+  if (next === 'cdrom') {
+    accessMode.value = 'readonly'
+  }
+}
+
+function updateAccessMode(value: unknown) {
+  const next = Array.isArray(value) ? value[0] : value
+  if (next !== 'readonly' && next !== 'readwrite') return
+  accessMode.value = next
 }
 
 const breadcrumbs = computed(() => {
@@ -203,20 +257,32 @@ async function refreshDiskSpace() {
 
 async function loadData() {
   await refreshDiskSpace()
-  await systemStore.fetchMsdState()
+  await refreshMsdState()
   await loadImages()
   await loadDriveInfo()
-  if (driveInitialized.value) {
+  if (driveFilesAvailable.value) {
     await loadDriveFiles()
+  }
+}
+
+async function refreshMsdState() {
+  msdStatusError.value = null
+  try {
+    await systemStore.fetchMsdState()
+  } catch (e: any) {
+    msdStatusError.value = e?.message ?? t('msd.errors.operationFailed')
   }
 }
 
 async function loadImages() {
   loadingImages.value = true
+  imagesError.value = null
   try {
     images.value = await msdApi.listImages()
-  } catch (e) {
+  } catch (e: any) {
     console.error('Failed to load images:', e)
+    imagesError.value = e?.message ?? t('msd.errors.operationFailed')
+    images.value = []
   } finally {
     loadingImages.value = false
   }
@@ -251,12 +317,30 @@ async function connectImage(image: MsdImage) {
     return
   }
 
+  if (mountedImage(image.id)) return
+  if (mediaSlotsFull.value) {
+    toast.error(t('msd.mediaSlotsFull'))
+    return
+  }
+
+  pendingMountImage.value = image
+  mountMode.value = isIsoImage(image) ? 'cdrom' : 'flash'
+  accessMode.value = isIsoImage(image) ? 'readonly' : 'readwrite'
+  showMountOptionsDialog.value = true
+}
+
+async function confirmImageMount() {
+  const image = pendingMountImage.value
+  if (!image || operationInProgress.value) return
+
   connecting.value = true
   try {
-    await msdApi.connect('image', image.id, cdromMode.value, readOnly.value)
-    await systemStore.fetchMsdState()
+    await msdApi.mountImage(image.id, cdromMode.value, cdromMode.value || readOnly.value)
+    await refreshMsdState()
+    showMountOptionsDialog.value = false
+    pendingMountImage.value = null
   } catch (e) {
-    console.error('Failed to connect image:', e)
+    console.error('Failed to mount image:', e)
   } finally {
     connecting.value = false
   }
@@ -268,30 +352,60 @@ async function connectDrive() {
     return
   }
 
+  if (driveConnectedToTarget.value) return
+  if (mediaSlotsFull.value) {
+    toast.error(t('msd.mediaSlotsFull'))
+    return
+  }
+
   connecting.value = true
   try {
-    await msdApi.connect('drive')
-    await systemStore.fetchMsdState()
+    await msdApi.mountDrive()
+    await refreshMsdState()
   } catch (e) {
-    console.error('Failed to connect drive:', e)
+    console.error('Failed to mount drive:', e)
   } finally {
     connecting.value = false
   }
 }
 
-async function disconnect() {
-  if (operationInProgress.value) {
-    return
-  }
+async function unmountMedia(media: MountedMedia) {
+  if (operationInProgress.value) return
 
-  disconnecting.value = true
+  unmountingMediaId.value = `${media.kind}:${media.id}`
   try {
-    await msdApi.disconnect()
-    await systemStore.fetchMsdState()
+    if (media.kind === 'drive') {
+      await msdApi.unmountDrive()
+    } else {
+      await msdApi.unmountImage(media.id)
+    }
+    await refreshMsdState()
   } catch (e) {
-    console.error('Failed to disconnect:', e)
+    console.error('Failed to unmount media:', e)
   } finally {
-    disconnecting.value = false
+    unmountingMediaId.value = null
+  }
+}
+
+async function unmountImageById(imageId: string) {
+  const media = mountedImage(imageId)
+  if (media) {
+    await unmountMedia(media)
+  }
+}
+
+async function changeDiskMode(value: unknown) {
+  const next = Array.isArray(value) ? value[0] : value
+  if ((next !== 'single' && next !== 'multi') || next === diskMode.value || operationInProgress.value) return
+
+  modeChanging.value = true
+  try {
+    await msdApi.setDiskMode(next as DiskMode)
+    await refreshMsdState()
+  } catch (e) {
+    console.error('Failed to change MSD disk mode:', e)
+  } finally {
+    modeChanging.value = false
   }
 }
 
@@ -321,9 +435,8 @@ async function executeDelete() {
       await msdApi.deleteDriveFile(deleteTarget.value.id)
       await loadDriveFiles()
     }
-  } catch (e: any) {
+  } catch (e) {
     console.error('Failed to delete:', e)
-    toast.error(t('common.error'), { description: e?.message })
   } finally {
     showDeleteDialog.value = false
     deleteTarget.value = null
@@ -333,12 +446,14 @@ async function executeDelete() {
 
 async function loadDriveInfo() {
   driveError.value = null
+  driveErrorCode.value = null
   try {
     driveInfo.value = await msdApi.driveInfo()
     driveInitialized.value = true
+    driveFiles.value = driveFilesAvailable.value ? driveFiles.value : []
   } catch (e: any) {
     if (e instanceof ApiError) {
-      if (e.status === 404) {
+      if (e.code === 'MSD_DRIVE_NOT_INITIALIZED' || e.status === 404) {
         // Drive image file does not exist — truly not initialized
         driveInitialized.value = false
         driveInfo.value = null
@@ -348,6 +463,7 @@ async function loadDriveInfo() {
         // an error banner instead of the misleading "Initialize Drive" button.
         driveInitialized.value = true
         driveError.value = e.message
+        driveErrorCode.value = e.code ?? null
         driveInfo.value = null
       }
     } else {
@@ -377,12 +493,11 @@ async function createDrive() {
     const sizeMb = finalDriveSize.value
     await msdApi.initDrive(sizeMb)
     await loadDriveInfo()
-    await loadDriveFiles()
+    if (driveFilesAvailable.value) await loadDriveFiles()
     await refreshDiskSpace()
     showDriveInitDialog.value = false
   } catch (e) {
     console.error('Failed to initialize drive:', e)
-    toast.error(t('msd.driveCreateFailed'))
   } finally {
     initializingDrive.value = false
   }
@@ -408,18 +523,20 @@ async function deleteDrive() {
 async function loadDriveFiles() {
   // Do not read image file while it is mounted on the target machine:
   // concurrent access causes filesystem corruption (Windows error 0x80070570)
-  if (driveConnectedToTarget.value) {
+  if (driveConnectedToTarget.value || !driveFilesAvailable.value) {
     driveFiles.value = []
     return
   }
   loadingDrive.value = true
   driveError.value = null
+  driveErrorCode.value = null
   try {
     driveFiles.value = await msdApi.listDriveFiles(currentPath.value)
   } catch (e: any) {
     console.error('Failed to load drive files:', e)
     // Surface the error — could be unsupported filesystem format
     driveError.value = e?.message ?? String(e)
+    driveErrorCode.value = e instanceof ApiError ? (e.code ?? null) : null
     driveFiles.value = []
   } finally {
     loadingDrive.value = false
@@ -428,7 +545,7 @@ async function loadDriveFiles() {
 
 async function refreshDriveBrowser() {
   await loadDriveInfo()
-  if (driveInitialized.value) {
+  if (driveFilesAvailable.value) {
     await loadDriveFiles()
   } else {
     driveFiles.value = []
@@ -468,9 +585,8 @@ async function handleFileUpload(e: Event) {
       fileUploadProgress.value = progress
     })
     await loadDriveFiles()
-  } catch (e: any) {
+  } catch (e) {
     console.error('Failed to upload file:', e)
-    toast.error(t('msd.uploadFailed'), { description: e?.message })
   } finally {
     uploadingFile.value = false
     fileUploadProgress.value = 0
@@ -495,9 +611,8 @@ async function createFolder() {
       : currentPath.value + '/' + newFolderName.value
     await msdApi.createDirectory(path)
     await loadDriveFiles()
-  } catch (e: any) {
+  } catch (e) {
     console.error('Failed to create folder:', e)
-    toast.error(t('common.error'), { description: e?.message })
   } finally {
     showNewFolderDialog.value = false
     newFolderName.value = ''
@@ -520,6 +635,7 @@ async function startUrlDownload() {
       total_bytes: result.total_bytes,
       progress_pct: result.progress_pct,
       status: result.status,
+      error_code: result.error_code,
     }
   } catch (e) {
     console.error('Failed to start download:', e)
@@ -553,6 +669,7 @@ function handleDownloadProgress(data: {
   total_bytes: number | null
   progress_pct: number | null
   status: string
+  error_code: string | null
 }) {
   if (downloadProgress.value?.download_id === data.download_id) {
     downloadProgress.value = data
@@ -563,8 +680,14 @@ function handleDownloadProgress(data: {
         showUrlDialog.value = false
         resetDownloadState()
       }, 1000)
-    } else if (data.status.startsWith('failed')) {
+    } else if (data.status === 'failed') {
       downloading.value = false
+      if (downloadFailureNotifiedId.value !== data.download_id) {
+        downloadFailureNotifiedId.value = data.download_id
+        toast.error(t('msd.operations.downloadImage'), {
+          description: localizeMsdErrorCode(data.error_code ?? undefined),
+        })
+      }
     }
   }
 }
@@ -591,221 +714,249 @@ onUnmounted(() => {
 <template>
   <TooltipProvider>
     <Dialog :open="open" @update:open="emit('update:open', $event)">
-      <DialogContent class="sm:max-w-[600px] max-h-[90vh] overflow-hidden flex flex-col p-0">
-      <DialogHeader class="px-6 pt-6 shrink-0">
+      <DialogContent class="max-h-[90vh] overflow-hidden p-0 sm:max-w-[760px] flex flex-col">
+      <DialogHeader class="px-5 pt-4 shrink-0">
         <DialogTitle class="flex items-center gap-2">
-          <HardDrive class="h-5 w-5" />
+          <HardDrive class="size-5" />
           {{ t('msd.title') }}
         </DialogTitle>
-        <DialogDescription class="flex items-center flex-wrap gap-x-2 gap-y-1 mt-1">
-          <span :class="msdConnected ? 'text-green-600 dark:text-green-400' : 'text-muted-foreground'" class="flex items-center gap-1.5">
-            <span class="relative flex h-2 w-2">
-              <span v-if="msdConnected" class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-              <span :class="msdConnected ? 'bg-green-500' : 'bg-muted-foreground'" class="relative inline-flex rounded-full h-2 w-2"></span>
+        <DialogDescription as="div" class="mt-1 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <span class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+            <span :class="msdConnected ? 'text-success' : 'text-muted-foreground'" class="flex items-center gap-1.5">
+              <span class="relative flex size-2">
+                <span v-if="msdConnected" class="absolute inline-flex size-full animate-ping rounded-full bg-status-active opacity-75"></span>
+                <span :class="msdConnected ? 'bg-status-active' : 'bg-muted-foreground'" class="relative inline-flex size-2 rounded-full"></span>
+              </span>
+              {{ msdConnected ? t('common.connected') : t('common.disconnected') }}
             </span>
-            {{ msdConnected ? t('common.connected') : t('common.disconnected') }}
-          </span>
-          <template v-if="msdConnected">
             <span class="text-muted-foreground">·</span>
-            <Badge variant="secondary" class="text-xs">{{ msdMode === 'drive' ? t('msd.drive') : t('msd.images') }}</Badge>
-            <Button
+            <Badge variant="secondary" class="h-6 rounded-md px-2 text-xs">{{ t('msd.mediaCount', { count: mountedCount, capacity: slotCapacity }) }}</Badge>
+            <Badge
+              v-if="mediaSlotsFull"
               variant="outline"
-              size="sm"
-              class="h-6 px-2 text-xs text-destructive hover:text-destructive hover:bg-destructive/10 border-destructive/30"
-              :disabled="operationInProgress"
-              @click="disconnect"
+              class="h-6 border-warning/40 bg-warning/10 px-2 text-xs text-warning"
             >
-              <Unlink v-if="!disconnecting" class="h-3 w-3 mr-1" />
-              <span v-if="disconnecting">{{ t('common.disconnecting') }}...</span>
-              <span v-else>{{ t('msd.disconnect') }}</span>
-            </Button>
-          </template>
+              {{ t('msd.mediaSlotsFull') }}
+            </Badge>
+            <span v-if="usbReenumerating" class="text-xs text-warning">
+              {{ t('msd.reenumerating') }}
+            </span>
+          </span>
+          <span class="flex w-full shrink-0 items-center gap-2 sm:w-auto">
+            <span class="flex shrink-0 items-center gap-1.5">
+              <span class="font-medium text-foreground">{{ t('msd.diskMode') }}</span>
+              <Tooltip>
+                <TooltipTrigger as-child>
+                  <span class="inline-flex size-4 items-center justify-center rounded-full text-muted-foreground hover:text-foreground">
+                    <Info class="size-3.5" />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p class="max-w-xs">{{ t('msd.diskModeHint') }}</p>
+                </TooltipContent>
+              </Tooltip>
+            </span>
+            <ToggleGroup
+              :model-value="diskMode"
+              type="single"
+              size="sm"
+              :spacing="1"
+              :class="[segmentedGroupClass, 'min-w-0 flex-1 sm:w-[200px] sm:flex-none']"
+              :disabled="operationInProgress"
+              @update:model-value="changeDiskMode"
+            >
+              <ToggleGroupItem value="single" :class="segmentedItemClass">{{ t('msd.singleDiskMode') }}</ToggleGroupItem>
+              <ToggleGroupItem value="multi" :class="segmentedItemClass">{{ t('msd.multiDiskMode') }}</ToggleGroupItem>
+            </ToggleGroup>
+          </span>
         </DialogDescription>
       </DialogHeader>
 
       <Separator class="shrink-0" />
 
-      <div class="flex-1 min-h-0 flex flex-col px-6 pb-6 pt-4">
+      <div
+        v-if="msdStatusError"
+        class="mx-5 mt-3 flex shrink-0 items-center justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/5 p-3"
+      >
+        <div class="min-w-0">
+          <p class="text-sm font-medium text-destructive">{{ t('msd.operations.loadStatus') }}</p>
+          <p class="mt-1 text-xs text-muted-foreground">{{ msdStatusError }}</p>
+        </div>
+        <Button variant="outline" size="sm" @click="refreshMsdState">{{ t('common.retry') }}</Button>
+      </div>
+
+      <div class="flex-1 min-h-0 flex flex-col px-5 pb-4 pt-3">
         <Tabs v-model="activeTab" class="flex-1 flex flex-col min-h-0">
-          <TabsList class="w-full grid grid-cols-2 shrink-0">
-          <TabsTrigger value="images">
-            <Disc class="h-4 w-4 mr-1.5" />
+          <TabsList class="grid h-auto w-full shrink-0 grid-cols-2 gap-1 rounded-md border border-border bg-muted p-0.5">
+          <TabsTrigger value="images" :class="tabTriggerClass">
+            <Disc class="size-4 mr-1.5" />
             {{ t('msd.images') }}
           </TabsTrigger>
-          <TabsTrigger value="drive">
-            <HardDrive class="h-4 w-4 mr-1.5" />
+          <TabsTrigger value="drive" :class="tabTriggerClass">
+            <HardDrive class="size-4 mr-1.5" />
             {{ t('msd.drive') }}
           </TabsTrigger>
         </TabsList>
 
-        <!-- Tab Description -->
-        <p class="text-xs text-muted-foreground mt-2 mb-1 shrink-0">
-          {{ activeTab === 'images' ? t('msd.imagesDesc') : t('msd.driveDesc') }}
-        </p>
-
-          <TabsContent value="images" class="flex-1 min-h-0 m-0 flex flex-col space-y-3">
-            <!-- Compact Upload Toolbar -->
-            <div class="shrink-0 flex items-center gap-2 min-w-0">
-              <label class="flex-1">
-                <input
-                  type="file"
-                  class="hidden"
-                  accept=".iso,.img"
-                  :disabled="uploading"
-                  @change="handleImageUpload"
-                />
-                <Button variant="outline" size="sm" as="span" class="w-full cursor-pointer">
-                  <Upload class="h-4 w-4 mr-1.5" />
-                  {{ t('msd.uploadImage') }}
-                </Button>
-              </label>
-              <Button
-                variant="outline"
-                size="sm"
-                class="flex-1"
-                @click="showUrlDialog = true"
-              >
-                <Globe class="h-4 w-4 mr-1.5" />
-                {{ t('msd.downloadFromUrl') }}
-              </Button>
-            </div>
-            <Progress v-if="uploading" :model-value="uploadProgress" class="h-1 shrink-0" />
-
-            <!-- Options - Vertical compact layout -->
-            <div class="shrink-0 flex flex-wrap items-center gap-x-4 gap-y-2 p-2 rounded-lg bg-muted/50 text-xs min-w-0">
-              <div class="flex items-center gap-1.5">
-                <span class="text-muted-foreground whitespace-nowrap">{{ t('msd.storageMode') }}:</span>
-                <HelpTooltip :content="mountMode === 'flash' ? t('help.flashMode') : t('help.cdromMode')" icon-size="sm" />
-                <ToggleGroup v-model="mountMode" type="single" variant="outline" size="sm">
-                  <ToggleGroupItem value="flash" class="h-6 px-2 text-xs data-[state=on]:bg-primary data-[state=on]:text-primary-foreground">
-                    {{ t('msd.flash') }}
-                  </ToggleGroupItem>
-                  <ToggleGroupItem value="cdrom" class="h-6 px-2 text-xs data-[state=on]:bg-primary data-[state=on]:text-primary-foreground">
-                    {{ t('msd.cdrom') }}
-                  </ToggleGroupItem>
-                </ToggleGroup>
-              </div>
-              <div class="flex items-center gap-1.5">
-                <span class="text-muted-foreground whitespace-nowrap">{{ t('msd.accessMode') }}:</span>
-                <HelpTooltip :content="accessMode === 'readonly' ? t('help.readOnlyMode') : t('help.readWriteMode')" icon-size="sm" />
-                <ToggleGroup v-model="accessMode" type="single" variant="outline" size="sm">
-                  <ToggleGroupItem value="readonly" class="h-6 px-2 text-xs data-[state=on]:bg-primary data-[state=on]:text-primary-foreground">
-                    {{ t('msd.readOnly') }}
-                  </ToggleGroupItem>
-                  <ToggleGroupItem value="readwrite" class="h-6 px-2 text-xs data-[state=on]:bg-primary data-[state=on]:text-primary-foreground">
-                    {{ t('msd.readWrite') }}
-                  </ToggleGroupItem>
-                </ToggleGroup>
-              </div>
-            </div>
-
+          <TabsContent value="images" class="m-0 flex min-h-0 flex-1 flex-col space-y-3 pt-3">
             <!-- Image List -->
             <div class="flex-1 min-h-0 flex flex-col space-y-2 min-w-0">
-              <div class="shrink-0 flex items-center justify-between">
+              <div class="flex shrink-0 flex-wrap items-center justify-between gap-2">
                 <h4 class="text-sm font-medium">{{ t('msd.imageList') }}</h4>
-                <Button variant="ghost" size="icon" class="h-7 w-7" @click="loadImages">
-                  <RefreshCw class="h-3.5 w-3.5" :class="{ 'animate-spin': loadingImages }" />
-                </Button>
+                <div class="flex flex-wrap items-center justify-end gap-1.5">
+                  <label>
+                    <input
+                      type="file"
+                      class="hidden"
+                      accept=".iso,.img"
+                      :disabled="uploading"
+                      @change="handleImageUpload"
+                    />
+                    <Button variant="outline" size="sm" as="span" class="h-8 cursor-pointer px-2.5 text-xs">
+                      <Upload class="mr-1.5 size-3.5" />
+                      {{ t('msd.uploadImage') }}
+                    </Button>
+                  </label>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    class="h-8 px-2.5 text-xs"
+                    @click="showUrlDialog = true"
+                  >
+                    <Globe class="mr-1.5 size-3.5" />
+                    {{ t('msd.downloadFromUrl') }}
+                  </Button>
+                  <Button variant="ghost" size="icon-sm" @click="loadImages">
+                    <RefreshCw class="size-3.5" :class="{ 'animate-spin': loadingImages }" />
+                  </Button>
+                </div>
               </div>
-
-              <div v-if="images.length === 0" class="shrink-0 text-center py-6 text-muted-foreground text-sm">
-                {{ t('msd.noImages') }}
-              </div>
-
-              <div v-else class="flex-1 min-h-0 overflow-y-auto pr-2 custom-scrollbar">
+              <div class="min-h-0 flex-1 overflow-y-auto pr-2 custom-scrollbar">
                 <div class="space-y-2">
                   <div
-                    v-for="image in images"
-                    :key="image.id"
-                    class="p-3 rounded-lg border transition-colors"
-                    :class="[
-                      msdConnected && systemStore.msd?.imageId === image.id
-                        ? 'border-primary bg-primary/5'
-                        : 'hover:bg-accent/50'
-                    ]"
+                    v-if="uploading"
+                    class="grid shrink-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2"
                   >
-                    <div class="flex items-start justify-between gap-2">
-                      <div class="flex items-start gap-2 w-0 flex-1">
-                        <Disc class="h-4 w-4 text-muted-foreground shrink-0 mt-0.5" />
-                        <div class="w-0 flex-1">
-                          <Tooltip>
-                            <TooltipTrigger as-child>
-                              <p class="text-sm font-medium cursor-help overflow-hidden text-ellipsis whitespace-nowrap">{{ image.name }}</p>
-                            </TooltipTrigger>
-                            <TooltipContent>
-                              <p class="max-w-sm break-all">{{ image.name }}</p>
-                            </TooltipContent>
-                          </Tooltip>
-                          <div class="flex items-center gap-2 mt-0.5 flex-wrap">
-                            <span class="text-xs text-muted-foreground">{{ formatBytes(image.size) }}</span>
-                            <Tooltip v-if="isLargeFile(image)">
+                    <Progress :model-value="uploadProgress" class="h-1 min-w-0" />
+                    <span class="justify-self-end text-right text-xs tabular-nums text-muted-foreground">
+                      {{ uploadProgressPercent }}%
+                    </span>
+                  </div>
+
+                  <Skeleton v-if="loadingImages" class="h-24 w-full" />
+                  <div
+                    v-else-if="imagesError"
+                    class="flex shrink-0 items-center justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/5 p-3"
+                  >
+                    <div class="min-w-0">
+                      <p class="text-sm font-medium text-destructive">{{ t('msd.operations.loadImages') }}</p>
+                      <p class="mt-1 text-xs text-muted-foreground">{{ imagesError }}</p>
+                    </div>
+                    <Button variant="outline" size="sm" @click="loadImages">{{ t('common.retry') }}</Button>
+                  </div>
+                  <Empty v-else-if="images.length === 0" class="shrink-0 py-6">
+                    <EmptyHeader>
+                      <EmptyMedia variant="icon"><HardDrive /></EmptyMedia>
+                      <EmptyDescription>{{ t('msd.noImages') }}</EmptyDescription>
+                    </EmptyHeader>
+                  </Empty>
+
+                  <template v-else v-for="image in images" :key="image.id">
+                    <div
+                      class="rounded-md border p-2.5 transition-colors"
+                      :class="[
+                        mountedImage(image.id)
+                          ? 'border-primary/40 bg-muted/50'
+                          : 'border-border bg-background hover:bg-muted/40'
+                      ]"
+                    >
+                      <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div class="flex min-w-0 flex-1 items-start gap-2">
+                          <span v-if="mountedImage(image.id)" class="mt-1.5 size-2 shrink-0 rounded-full bg-primary" />
+                          <Disc v-else class="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                          <div class="w-0 flex-1">
+                            <Tooltip>
                               <TooltipTrigger as-child>
-                                <Badge
-                                  variant="outline"
-                                  class="text-[10px] h-4 px-1.5 border-amber-500/50 text-amber-600 dark:text-amber-400 cursor-help"
-                                >
-                                  <AlertCircle class="h-2.5 w-2.5 mr-0.5" />
-                                  {{ t('msd.largeFileWarning') }}
-                                </Badge>
+                                <p class="text-sm font-medium cursor-help overflow-hidden text-ellipsis whitespace-nowrap">{{ image.name }}</p>
                               </TooltipTrigger>
                               <TooltipContent>
-                                <p>{{ t('msd.largeFileTooltip') }}</p>
+                                <p class="max-w-sm break-all">{{ image.name }}</p>
                               </TooltipContent>
                             </Tooltip>
+                            <div class="flex items-center gap-2 mt-0.5 flex-wrap">
+                              <span class="text-xs text-muted-foreground">{{ formatBytes(image.size) }}</span>
+                              <Tooltip v-if="isLargeFile(image)">
+                                <TooltipTrigger as-child>
+                                  <Badge
+                                    variant="outline"
+                                    class="h-4 cursor-help border-warning/50 px-1.5 text-[10px] text-warning"
+                                  >
+                                    <AlertCircle class="size-2.5 mr-0.5" />
+                                    {{ t('msd.largeFileWarning') }}
+                                  </Badge>
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  <p>{{ t('msd.largeFileTooltip') }}</p>
+                                </TooltipContent>
+                              </Tooltip>
+                            </div>
                           </div>
                         </div>
-                      </div>
-                      <div class="flex items-center gap-1.5 shrink-0">
-                        <template v-if="msdConnected && systemStore.msd?.imageId === image.id">
-                          <Badge variant="default" class="text-xs h-7 px-2">
-                            <span class="relative flex h-1.5 w-1.5 mr-1.5">
-                              <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
-                              <span class="relative inline-flex rounded-full h-1.5 w-1.5 bg-white"></span>
-                            </span>
-                            {{ t('common.connected') }}
-                          </Badge>
-                        </template>
-                        <template v-else>
+                        <div class="flex shrink-0 items-center justify-end gap-1.5">
+                          <template v-if="mountedImage(image.id)">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              class="h-8 text-xs"
+                              :disabled="operationInProgress"
+                              @click="unmountImageById(image.id)"
+                            >
+                              <Unlink class="size-3.5 mr-1" />
+                              {{ t('msd.disconnect') }}
+                            </Button>
+                          </template>
+                          <template v-else>
+                            <Button
+                              variant="default"
+                              size="sm"
+                              class="h-8 text-xs"
+                              :disabled="operationInProgress || mediaSlotsFull"
+                              @click="connectImage(image)"
+                            >
+                              <Link v-if="!connecting" class="size-3.5 mr-1" />
+                              <span v-if="connecting">{{ t('common.connecting') }}...</span>
+                              <span v-else>{{ t('msd.connect') }}</span>
+                            </Button>
+                          </template>
                           <Button
-                            variant="default"
-                            size="sm"
-                            class="h-7 text-xs"
-                            :disabled="operationInProgress"
-                            @click="connectImage(image)"
+                            variant="ghost"
+                            size="icon"
+                            class="size-8 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                            :disabled="operationInProgress || !!mountedImage(image.id)"
+                            @click="confirmDelete('image', image.id, image.name)"
                           >
-                            <Link v-if="!connecting" class="h-3.5 w-3.5 mr-1" />
-                            <span v-if="connecting">{{ t('common.connecting') }}...</span>
-                            <span v-else>{{ t('msd.connect') }}</span>
+                            <Trash2 class="size-3.5" />
                           </Button>
-                        </template>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          class="h-7 w-7 text-destructive hover:text-destructive"
-                          :disabled="operationInProgress || (msdConnected && systemStore.msd?.imageId === image.id)"
-                          @click="confirmDelete('image', image.id, image.name)"
-                        >
-                          <Trash2 class="h-3.5 w-3.5" />
-                        </Button>
+                        </div>
                       </div>
                     </div>
-                  </div>
+                  </template>
                 </div>
               </div>
 
               <!-- System Storage Footer -->
-              <div v-if="systemStore.diskSpace" class="shrink-0 pt-2 border-t mt-2">
-                <p class="text-[11px] text-muted-foreground text-center">
+              <div v-if="systemStore.diskSpace" class="mt-2 shrink-0 border-t pt-2">
+                <p class="text-right text-[11px] text-muted-foreground">
                   {{ t('msd.systemAvailable') }}: {{ formatBytes(systemStore.diskSpace.available) }}
                 </p>
               </div>
             </div>
           </TabsContent>
 
-          <TabsContent value="drive" class="flex-1 min-h-0 m-0 flex flex-col space-y-4">
+          <TabsContent value="drive" class="m-0 flex min-h-0 flex-1 flex-col space-y-4 pt-3">
             <template v-if="!driveInitialized">
               <div class="shrink-0 text-center py-8 space-y-4">
-                <HardDrive class="h-10 w-10 mx-auto text-muted-foreground" />
+                <HardDrive class="size-10 mx-auto text-muted-foreground" />
                 <p class="text-sm text-muted-foreground">{{ t('msd.driveNotInitialized') }}</p>
                 <Button size="sm" @click="initializeDrive">
                   {{ t('msd.initializeDrive') }}
@@ -816,100 +967,137 @@ onUnmounted(() => {
             <template v-else>
               <!-- Drive Info Card -->
               <div
-                class="shrink-0 p-3 rounded-lg border space-y-3"
-                :class="msdConnected && msdMode === 'drive'
+                class="shrink-0 space-y-3 rounded-md border p-3"
+                :class="driveConnectedToTarget
                   ? 'border-primary bg-primary/5'
                   : driveError
                     ? 'border-destructive/40 bg-destructive/5'
+                    : driveFilesystemUnsupported
+                      ? 'border-warning/40 bg-warning/5'
                     : 'bg-muted/50'"
               >
                 <div class="flex items-center justify-between">
                   <div class="flex items-center gap-2">
-                    <HardDrive class="h-4 w-4 text-muted-foreground" />
+                    <HardDrive class="size-4 text-muted-foreground" />
                     <span class="text-sm font-medium">{{ t('msd.drive') }}</span>
-                    <!-- Show size badge only when info is available -->
                     <Badge v-if="driveInfo" variant="outline" class="text-xs">
                       {{ Math.round((driveInfo?.size || 0) / 1024 / 1024) }} MB
                     </Badge>
-                    <!-- Show unreadable badge when format is wrong -->
+                    <Badge
+                      v-if="driveFilesystemUnsupported"
+                      variant="outline"
+                      class="border-warning/50 text-xs text-warning"
+                    >
+                      {{ t('msd.driveUnreadable') }}
+                    </Badge>
                     <template v-else-if="driveError">
                       <Badge variant="outline" class="text-xs border-destructive/50 text-destructive">
-                        {{ t('msd.driveUnreadable') }}
+                        {{ t('common.error') }}
                       </Badge>
                       <Tooltip>
                         <TooltipTrigger as-child>
-                          <span class="inline-flex h-4 w-4 items-center justify-center text-muted-foreground hover:text-foreground">
-                            <Info class="h-3.5 w-3.5" />
+                          <span class="inline-flex size-4 items-center justify-center text-muted-foreground hover:text-foreground">
+                            <Info class="size-3.5" />
                           </span>
                         </TooltipTrigger>
                         <TooltipContent>
-                          <p>{{ t('msd.driveUnreadableTooltip') }}</p>
+                          <p>{{ driveError }}</p>
                         </TooltipContent>
                       </Tooltip>
                     </template>
                   </div>
                   <div class="flex items-center gap-1.5">
-                    <!-- When drive format is unrecognized, only offer re-initialization -->
-                    <template v-if="driveError && !msdConnected">
+                    <template v-if="driveConnectedToTarget">
+                      <Badge variant="default" class="h-8 px-2 text-xs">
+                        <span class="relative flex size-1.5 mr-1.5">
+                          <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary-foreground opacity-75"></span>
+                          <span class="relative inline-flex size-1.5 rounded-full bg-primary-foreground"></span>
+                        </span>
+                        {{ t('common.connected') }}
+                      </Badge>
                       <Button
+                        v-if="driveMedia"
                         variant="outline"
                         size="sm"
-                        class="h-7 text-xs"
+                        class="h-8 text-xs"
+                        :disabled="operationInProgress"
+                        @click="unmountMedia(driveMedia)"
+                      >
+                        <Unlink class="size-3.5 mr-1" />
+                        {{ t('msd.disconnect') }}
+                      </Button>
+                    </template>
+                    <template v-else>
+                      <Button
+                        variant="default"
+                        size="sm"
+                        class="h-8 text-xs"
+                        :disabled="operationInProgress || mediaSlotsFull || !driveInfo || !!driveError"
+                        @click="connectDrive"
+                      >
+                        <Link v-if="!connecting" class="size-3.5 mr-1" />
+                        <span v-if="connecting">{{ t('common.connecting') }}...</span>
+                        <span v-else>{{ t('msd.connect') }}</span>
+                      </Button>
+                      <Button
+                        v-if="driveFilesystemUnsupported"
+                        variant="outline"
+                        size="sm"
+                        class="h-8 text-xs"
                         :disabled="operationInProgress"
                         @click="initializeDrive"
                       >
                         {{ t('msd.reinitializeDrive') }}
                       </Button>
                     </template>
-                    <template v-else-if="msdConnected && msdMode === 'drive'">
-                      <Badge variant="default" class="text-xs h-7 px-2">
-                        <span class="relative flex h-1.5 w-1.5 mr-1.5">
-                          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
-                          <span class="relative inline-flex rounded-full h-1.5 w-1.5 bg-white"></span>
-                        </span>
-                        {{ t('common.connected') }}
-                      </Badge>
-                    </template>
-                    <template v-else>
-                      <Button
-                        variant="default"
-                        size="sm"
-                        class="h-7 text-xs"
-                        :disabled="operationInProgress"
-                        @click="connectDrive"
-                      >
-                        <Link v-if="!connecting" class="h-3.5 w-3.5 mr-1" />
-                        <span v-if="connecting">{{ t('common.connecting') }}...</span>
-                        <span v-else>{{ t('msd.connect') }}</span>
-                      </Button>
-                    </template>
                     <Button
                       variant="ghost"
                       size="icon"
-                      class="h-7 w-7 text-destructive hover:text-destructive"
-                      :disabled="operationInProgress || msdConnected"
+                      class="size-8 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                      :disabled="operationInProgress || driveConnectedToTarget"
                       @click="showDeleteDriveDialog = true"
                     >
-                      <Trash2 class="h-3.5 w-3.5" />
+                      <Trash2 class="size-3.5" />
                     </Button>
                   </div>
                 </div>
-                <!-- Storage usage bar — hidden when format is unrecognized -->
-                <div v-if="driveInfo" class="space-y-1.5">
+                <div
+                  v-if="driveFilesAvailable && driveInfo?.used !== null && driveInfo?.free !== null"
+                  class="space-y-1.5"
+                >
                   <Progress
-                    :model-value="driveInfo.size > 0 ? (driveInfo.used / driveInfo.size) * 100 : 0"
+                    :model-value="driveInfo && driveInfo.size > 0 ? ((driveInfo.used ?? 0) / driveInfo.size) * 100 : 0"
                     class="h-2"
                   />
                   <div class="flex items-center justify-between text-xs text-muted-foreground">
-                    <span>{{ formatBytes(driveInfo?.used || 0) }} {{ t('msd.usedSpace') }}</span>
-                    <span>{{ formatBytes(driveInfo?.free || 0) }} {{ t('msd.freeSpace') }}</span>
+                    <span>{{ formatBytes(driveInfo?.used ?? 0) }} {{ t('msd.usedSpace') }}</span>
+                    <span>{{ formatBytes(driveInfo?.free ?? 0) }} {{ t('msd.freeSpace') }}</span>
                   </div>
                 </div>
               </div>
 
+              <div
+                v-if="driveFilesystemUnsupported"
+                class="flex shrink-0 items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-3"
+              >
+                <Info class="mt-0.5 size-4 shrink-0 text-warning" />
+                <p class="text-sm text-muted-foreground">{{ t('msd.driveFilesystemUnsupportedHint') }}</p>
+              </div>
+
+              <div
+                v-if="driveError"
+                class="flex shrink-0 items-center justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/5 p-3"
+              >
+                <div class="min-w-0">
+                  <p class="text-sm font-medium text-destructive">{{ t('msd.operations.loadDriveFiles') }}</p>
+                  <p class="mt-1 text-xs text-muted-foreground">{{ driveError }}</p>
+                </div>
+                <Button variant="outline" size="sm" @click="refreshDriveBrowser">{{ t('common.retry') }}</Button>
+              </div>
+
 
               <!-- File Browser -->
-              <div class="flex-1 min-h-0 flex flex-col space-y-2">
+              <div v-if="driveFilesAvailable" class="flex-1 min-h-0 flex flex-col space-y-2">
 
                 <!-- Toolbar -->
                 <div class="shrink-0 flex items-center justify-between gap-2">
@@ -918,17 +1106,19 @@ onUnmounted(() => {
                       v-if="currentPath !== '/'"
                       variant="ghost"
                       size="icon"
-                      class="h-7 w-7 shrink-0"
+                      class="size-8 shrink-0"
                       :disabled="driveConnectedToTarget"
                       @click="navigateUp"
                     >
-                      <ArrowLeft class="h-3.5 w-3.5" />
+                      <ArrowLeft class="size-3.5" />
                     </Button>
                     <nav class="flex items-center text-xs min-w-0 overflow-hidden">
                       <template v-for="(crumb, index) in breadcrumbs" :key="crumb.path">
-                        <ChevronRight v-if="index > 0" class="h-3 w-3 text-muted-foreground mx-0.5 shrink-0" />
-                        <button
-                          class="hover:text-primary transition-colors truncate"
+                        <ChevronRight v-if="index > 0" class="size-3 text-muted-foreground mx-0.5 shrink-0" />
+                        <Button
+                          variant="link"
+                          size="sm"
+                          class="h-auto min-w-0 truncate p-0 font-normal"
                           :class="[
                             index === breadcrumbs.length - 1 ? 'font-medium' : 'text-muted-foreground',
                             driveConnectedToTarget ? 'cursor-not-allowed opacity-50' : ''
@@ -937,7 +1127,7 @@ onUnmounted(() => {
                           @click="!driveConnectedToTarget && navigateTo(crumb.path)"
                         >
                           {{ crumb.name }}
-                        </button>
+                        </Button>
                       </template>
                     </nav>
                   </div>
@@ -951,10 +1141,10 @@ onUnmounted(() => {
                             variant="ghost"
                             size="icon"
                             as="span"
-                            class="h-7 w-7"
+                            class="size-8"
                             :class="driveConnectedToTarget ? 'cursor-not-allowed opacity-40' : 'cursor-pointer'"
                           >
-                            <Upload class="h-3.5 w-3.5" />
+                            <Upload class="size-3.5" />
                           </Button>
                         </label>
                       </TooltipTrigger>
@@ -968,11 +1158,11 @@ onUnmounted(() => {
                         <Button
                           variant="ghost"
                           size="icon"
-                          class="h-7 w-7"
+                          class="size-8"
                           :disabled="driveConnectedToTarget"
                           @click="showNewFolderDialog = true"
                         >
-                          <FolderPlus class="h-3.5 w-3.5" />
+                          <FolderPlus class="size-3.5" />
                         </Button>
                       </TooltipTrigger>
                       <TooltipContent v-if="driveConnectedToTarget">
@@ -982,11 +1172,11 @@ onUnmounted(() => {
                     <Button
                       variant="ghost"
                       size="icon"
-                      class="h-7 w-7"
+                      class="size-8"
                       :disabled="driveConnectedToTarget"
                       @click="loadDriveFiles"
                     >
-                      <RefreshCw class="h-3.5 w-3.5" :class="{ 'animate-spin': loadingDrive }" />
+                      <RefreshCw class="size-3.5" :class="{ 'animate-spin': loadingDrive }" />
                     </Button>
                   </div>
                 </div>
@@ -994,34 +1184,27 @@ onUnmounted(() => {
                 <Progress v-if="uploadingFile" :model-value="fileUploadProgress" class="h-1 shrink-0" />
 
                 <!-- File List -->
-                <div
-                  v-if="driveFiles.length === 0 && !driveConnectedToTarget && !driveError"
-                  class="shrink-0 text-center py-6 text-muted-foreground text-sm"
-                >
-                  {{ t('msd.emptyFolder') }}
-                </div>
-
-                <!-- Connected placeholder: file list hidden while drive mounted on target -->
-                <div
-                  v-else-if="driveConnectedToTarget"
-                  class="shrink-0 text-center py-6 text-muted-foreground text-sm"
-                >
-                  {{ t('msd.driveConnectedFilesHidden') }}
-                </div>
+                <Skeleton v-if="loadingDrive" class="h-24 w-full" />
+                <Empty v-else-if="driveFiles.length === 0 && !driveError" class="shrink-0 py-6">
+                  <EmptyHeader>
+                    <EmptyMedia variant="icon"><Folder /></EmptyMedia>
+                    <EmptyDescription>{{ t('msd.emptyFolder') }}</EmptyDescription>
+                  </EmptyHeader>
+                </Empty>
 
                 <div v-else class="flex-1 min-h-0 overflow-y-auto pr-2 custom-scrollbar">
                   <div class="space-y-1">
                     <div
                       v-for="file in driveFiles"
                       :key="file.path"
-                      class="flex items-center justify-between p-2 rounded-lg hover:bg-accent/50 transition-colors"
+                      class="flex items-center justify-between rounded-md p-2 transition-colors hover:bg-accent/50"
                     >
                       <div
                         class="flex items-center gap-2 cursor-pointer flex-1 min-w-0"
                         @click="file.is_dir && navigateTo(file.path)"
                       >
-                        <Folder v-if="file.is_dir" class="h-4 w-4 text-blue-500 shrink-0" />
-                        <File v-else class="h-4 w-4 text-muted-foreground shrink-0" />
+                        <Folder v-if="file.is_dir" class="size-4 shrink-0 text-info" />
+                        <File v-else class="size-4 text-muted-foreground shrink-0" />
                         <div class="min-w-0">
                           <Tooltip>
                             <TooltipTrigger as-child>
@@ -1041,27 +1224,33 @@ onUnmounted(() => {
                           v-if="!file.is_dir"
                           variant="ghost"
                           size="icon"
-                          class="h-7 w-7"
+                          class="size-8"
                           as="a"
                           :href="msdApi.downloadDriveFile(file.path)"
                           download
                         >
-                          <Download class="h-3.5 w-3.5" />
+                          <Download class="size-3.5" />
                         </Button>
                         <!-- ③ Delete disabled when drive connected to target -->
                         <Button
                           variant="ghost"
                           size="icon"
-                          class="h-7 w-7 text-destructive"
+                          class="size-8 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                           :disabled="driveConnectedToTarget"
                           @click="confirmDelete('file', file.path, file.name)"
                         >
-                          <Trash2 class="h-3.5 w-3.5" />
+                          <Trash2 class="size-3.5" />
                         </Button>
                       </div>
                     </div>
                   </div>
                 </div>
+              </div>
+              <div
+                v-else-if="driveConnectedToTarget"
+                class="shrink-0 py-6 text-center text-sm text-muted-foreground"
+              >
+                {{ t('msd.driveConnectedFilesHidden') }}
               </div>
             </template>
           </TabsContent>
@@ -1177,6 +1366,69 @@ onUnmounted(() => {
     </DialogContent>
   </Dialog>
 
+  <!-- Image Mount Options Dialog -->
+  <Dialog v-model:open="showMountOptionsDialog">
+    <DialogContent class="max-w-md">
+      <DialogHeader class="min-w-0">
+        <DialogTitle>{{ t('msd.mountImage') }}</DialogTitle>
+        <DialogDescription
+          class="block min-w-0 truncate text-left"
+        >
+          {{ pendingMountImage?.name }}
+        </DialogDescription>
+      </DialogHeader>
+
+      <div class="space-y-4 py-2">
+        <div class="space-y-2">
+          <Label>{{ t('msd.storageMode') }}</Label>
+          <ToggleGroup
+            :model-value="mountMode"
+            type="single"
+            size="sm"
+            :spacing="1"
+            :class="segmentedGroupClass"
+            @update:model-value="updateMountMode"
+          >
+            <ToggleGroupItem value="flash" :class="segmentedItemClass">{{ t('msd.flash') }}</ToggleGroupItem>
+            <ToggleGroupItem value="cdrom" :class="segmentedItemClass">{{ t('msd.cdrom') }}</ToggleGroupItem>
+          </ToggleGroup>
+        </div>
+
+        <div class="space-y-2">
+          <Label>{{ t('msd.accessMode') }}</Label>
+          <ToggleGroup
+            :model-value="accessMode"
+            type="single"
+            size="sm"
+            :spacing="1"
+            :class="segmentedGroupClass"
+            @update:model-value="updateAccessMode"
+          >
+            <ToggleGroupItem value="readonly" :class="segmentedItemClass">{{ t('msd.readOnly') }}</ToggleGroupItem>
+            <ToggleGroupItem
+              value="readwrite"
+              :class="segmentedItemClass"
+              :disabled="cdromMode"
+            >
+              {{ t('msd.readWrite') }}
+            </ToggleGroupItem>
+          </ToggleGroup>
+        </div>
+      </div>
+
+      <DialogFooter>
+        <Button variant="outline" @click="showMountOptionsDialog = false" :disabled="connecting">
+          {{ t('common.cancel') }}
+        </Button>
+        <Button @click="confirmImageMount" :disabled="connecting || mediaSlotsFull">
+          <Link v-if="!connecting" class="size-4 mr-1" />
+          <span v-if="connecting">{{ t('common.connecting') }}...</span>
+          <span v-else>{{ t('msd.connect') }}</span>
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
   <!-- New Folder Dialog -->
   <Dialog v-model:open="showNewFolderDialog">
     <DialogContent>
@@ -1196,7 +1448,7 @@ onUnmounted(() => {
     <DialogContent>
       <DialogHeader>
         <DialogTitle class="flex items-center gap-2">
-          <Globe class="h-5 w-5" />
+          <Globe class="size-5" />
           {{ t('msd.downloadFromUrl') }}
         </DialogTitle>
         <DialogDescription>{{ t('msd.downloadFromUrlDesc') }}</DialogDescription>
@@ -1223,7 +1475,7 @@ onUnmounted(() => {
         </div>
 
         <!-- Download Progress -->
-        <div v-if="downloadProgress" class="space-y-2 p-3 rounded-lg bg-muted/50">
+        <div v-if="downloadProgress" class="space-y-2 rounded-md bg-muted/50 p-3">
           <div class="flex items-center justify-between text-sm">
             <span class="truncate">{{ downloadProgress.filename }}</span>
             <span class="text-muted-foreground shrink-0 ml-2">
@@ -1237,11 +1489,11 @@ onUnmounted(() => {
               / {{ formatBytes(downloadProgress.total_bytes) }}
             </span>
           </div>
-          <div v-if="downloadProgress.status === 'completed'" class="text-xs text-green-600">
+          <div v-if="downloadProgress.status === 'completed'" class="text-xs text-success">
             {{ t('msd.downloadComplete') }}
           </div>
-          <div v-else-if="downloadProgress.status.startsWith('failed')" class="text-xs text-destructive">
-            {{ downloadProgress.status }}
+          <div v-else-if="downloadProgress.status === 'failed'" class="text-xs text-destructive">
+            {{ localizeMsdErrorCode(downloadProgress.error_code ?? undefined) }}
           </div>
         </div>
       </div>
@@ -1255,11 +1507,11 @@ onUnmounted(() => {
           :disabled="!downloadUrl.trim()"
           @click="startUrlDownload"
         >
-          <Download class="h-4 w-4 mr-1" />
+          <Download class="size-4 mr-1" />
           {{ t('msd.download') }}
         </Button>
         <Button v-else variant="destructive" @click="cancelUrlDownload">
-          <X class="h-4 w-4 mr-1" />
+          <X class="size-4 mr-1" />
           {{ t('common.cancel') }}
         </Button>
       </DialogFooter>

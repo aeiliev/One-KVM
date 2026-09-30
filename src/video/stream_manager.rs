@@ -100,6 +100,8 @@ pub struct VideoStreamManager {
     events: RwLock<Option<Arc<EventBus>>>,
     /// Configuration store
     config_store: RwLock<Option<ConfigStore>>,
+    /// Codec constraints derived from services that are actually running.
+    runtime_codec_constraints: RwLock<Option<StreamCodecConstraints>>,
     /// Mode switching lock to prevent concurrent switch requests
     switching: AtomicBool,
     /// Current mode switch transaction ID (set while switching=true)
@@ -118,6 +120,7 @@ impl VideoStreamManager {
             webrtc_streamer,
             events: RwLock::new(None),
             config_store: RwLock::new(None),
+            runtime_codec_constraints: RwLock::new(None),
             switching: AtomicBool::new(false),
             transition_id: RwLock::new(None),
         })
@@ -144,8 +147,16 @@ impl VideoStreamManager {
         *self.config_store.write().await = Some(config);
     }
 
-    /// Get current stream codec constraints derived from global configuration.
+    pub async fn set_runtime_codec_constraints(&self, constraints: StreamCodecConstraints) {
+        *self.runtime_codec_constraints.write().await = Some(constraints);
+    }
+
+    /// Get current stream codec constraints derived from running services.
     pub async fn codec_constraints(&self) -> StreamCodecConstraints {
+        if let Some(constraints) = self.runtime_codec_constraints.read().await.as_ref() {
+            return constraints.clone();
+        }
+
         if let Some(ref config_store) = *self.config_store.read().await {
             let config = config_store.get();
             StreamCodecConstraints::from_config(&config)
@@ -184,25 +195,15 @@ impl VideoStreamManager {
         info!("Initializing video stream manager with mode: {:?}", mode);
         *self.mode.write().await = mode.clone();
 
-        // Check if streamer is already initialized (capturer exists)
-        let needs_init = self.streamer.state().await == StreamerState::Uninitialized;
+        // A failed fixed-device configuration can leave the streamer in a transient
+        // state without a capture device. Treat that the same as an uninitialized
+        // streamer so the advertised auto-detection fallback actually runs.
+        let state = self.streamer.state().await;
+        let (device_path, _, _, _, _) = self.streamer.current_capture_config().await;
+        let needs_init = state == StreamerState::Uninitialized || device_path.is_none();
 
         if needs_init {
-            match mode {
-                StreamMode::Mjpeg => {
-                    // Initialize MJPEG streamer
-                    if let Err(e) = self.streamer.init_auto().await {
-                        warn!("Failed to auto-initialize MJPEG streamer: {}", e);
-                    }
-                }
-                StreamMode::WebRTC => {
-                    // WebRTC is initialized on-demand when clients connect
-                    // But we still need to initialize the video capture
-                    if let Err(e) = self.streamer.init_auto().await {
-                        warn!("Failed to auto-initialize video capture for WebRTC: {}", e);
-                    }
-                }
-            }
+            self.streamer.init_auto().await?;
         }
 
         self.sync_webrtc_capture_source("after init").await;
@@ -347,29 +348,9 @@ impl VideoStreamManager {
             .update_video_config(resolution, format, fps)
             .await;
         if let Some(device_path) = device_path {
-            // Resolve the paired subdev so the WebRTC pipeline can run the
-            // RK628 STREAMON gate + SOURCE_CHANGE polling identically to the
-            // MJPEG path.  See `csi_bridge::discover_subdev_for_video`.
-            let (subdev_path, bridge_kind, v4l2_driver) = self
-                .streamer
-                .current_device()
-                .await
-                .map(|d| {
-                    (
-                        d.subdev_path.clone(),
-                        d.bridge_kind.clone(),
-                        Some(d.driver.clone()),
-                    )
-                })
-                .unwrap_or((None, None, None));
+            let device_info = self.streamer.current_device().await;
             self.webrtc_streamer
-                .set_capture_device(
-                    device_path,
-                    jpeg_quality,
-                    subdev_path,
-                    bridge_kind,
-                    v4l2_driver,
-                )
+                .set_capture_device(device_path, jpeg_quality, device_info)
                 .await;
         } else {
             warn!("No capture device configured while syncing WebRTC capture source");
@@ -423,7 +404,7 @@ impl VideoStreamManager {
                 let closed = self
                     .webrtc_streamer
                     .close_all_sessions_and_release_device()
-                    .await;
+                    .await?;
                 if closed > 0 {
                     info!("Closed {} WebRTC sessions", closed);
                 }
@@ -538,26 +519,9 @@ impl VideoStreamManager {
             }
             if let Some(device_path) = device_path {
                 info!("Configuring direct capture for WebRTC after config change");
-                let (subdev_path, bridge_kind, v4l2_driver) = self
-                    .streamer
-                    .current_device()
-                    .await
-                    .map(|d| {
-                        (
-                            d.subdev_path.clone(),
-                            d.bridge_kind.clone(),
-                            Some(d.driver.clone()),
-                        )
-                    })
-                    .unwrap_or((None, None, None));
+                let device_info = self.streamer.current_device().await;
                 self.webrtc_streamer
-                    .set_capture_device(
-                        device_path,
-                        jpeg_quality,
-                        subdev_path,
-                        bridge_kind,
-                        v4l2_driver,
-                    )
+                    .set_capture_device(device_path, jpeg_quality, device_info)
                     .await;
             } else {
                 warn!("No capture device configured for WebRTC after config change");

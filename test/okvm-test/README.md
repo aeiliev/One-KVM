@@ -76,8 +76,8 @@ python okvm_testctl.py run `
 
 控制端会先通过 SSH 执行 `lsusb -t`，再结合 `/api/devices` 自动选择视频输入：
 
-- USB2.0 采集卡：测试 `1080p30 MJPEG`，再切换 `1080p YUYV` 并选择该分辨率最高帧率；如果没有 1080p YUYV，才退到不超过 1080p 的最高分辨率。
-- USB3.0 采集卡：测试 `1080p60 MJPEG`，再切换 `1080p YUYV` 并选择该分辨率最高帧率；如果没有 1080p YUYV，才退到不超过 1080p 的最高分辨率。
+- USB2.0 采集卡（MS2131 测试档位）：严格测试 `1080p50 MJPEG` 和 `1080p10 YUYV`；任一格式、分辨率或帧率未申报时，立即将 `video_input_select` 标记为 `FAIL` 并中止测试，不回退到其他档位。
+- USB3.0 采集卡：测试 `1080p60 MJPEG`，再切换 `1080p YUYV` 并选择该分辨率申报的最高帧率；如果没有 1080p YUYV，立即将 `video_input_select` 标记为 `FAIL` 并中止测试，不再回退到较低分辨率。
 - CSI/MIPI：只测试一套 `1080p60 NV12`，不做输入格式切换。
 
 每个输入配置都会跑三种输出：
@@ -87,6 +87,7 @@ python okvm_testctl.py run `
 - H.265 WebRTC
 
 默认每个视频输出模式采样 30 秒；可通过 `--sample-seconds <秒数>` 覆盖。
+每次应用视频输入配置后默认先空转 3 秒，稳定后再开始统计；可通过 `--video-config-settle-seconds <秒数>` 调整。
 
 MJPEG/HTTP 测试时，控制端会让 Windows agent 输出默认 60fps 的全屏动态画面，避免静态画面触发 MJPEG “无变化不发帧”策略导致 fps 误判；可通过 `--mjpeg-motion-fps <fps>` 覆盖。
 
@@ -159,7 +160,7 @@ MSD 测试依赖 OTG。流程如下：
 2. 如果资源缺失，默认从 `libs/ventoy-img-rs/resources` 解压并通过 SSH/SFTP 同步到目标机。
 3. 启用 MSD 后重启 `one-kvm`，确保 Ventoy 资源在服务进程中初始化。
 4. 通过 `/api/msd/drive/init` 创建小型虚拟盘。
-5. 通过 `/api/msd/connect {"mode":"drive"}` 连接到 Windows。
+5. 通过 `/api/msd/drive/mount` 连接到 Windows。
 6. Windows agent 等待新盘符出现。
 7. Windows agent 写入测试文件、同步到虚拟盘、优先用未缓存读取读回并校验 SHA-256，同时输出简单写入/读取速度。若 Windows/驱动不支持未缓存读取，会退回缓存读取并在报告中标为“仅校验”，不作为真实读盘速度。
 8. 控制端断开 MSD，Windows agent 确认盘符消失。

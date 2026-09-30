@@ -2,7 +2,9 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { CanonicalKey } from '@/types/generated'
-import { cn } from '@/lib/utils'
+import { Badge } from '@/components/ui/badge'
+import { Kbd } from '@/components/ui/kbd'
+import { Separator } from '@/components/ui/separator'
 
 const props = defineProps<{
   pressedKeys?: CanonicalKey[]
@@ -13,6 +15,8 @@ const props = defineProps<{
   mousePosition?: { x: number; y: number }
   debugMode?: boolean
   compact?: boolean
+  captured?: boolean
+  minimal?: boolean
 }>()
 
 const { t } = useI18n()
@@ -40,25 +44,26 @@ const keysDisplay = computed(() => {
 </script>
 
 <template>
-  <div class="w-full border-t border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
+  <div class="w-full border-t bg-background">
     <!-- Compact mode (explicit prop or auto on small screens via sm:hidden) -->
     <div :class="compact ? '' : 'sm:hidden'">
-      <div class="flex items-center justify-between text-xs px-2 py-0.5">
-        <div v-if="keyboardLedEnabled" class="flex items-center gap-1">
-          <span
-            :class="capsLock ? 'px-1.5 py-0.5 bg-primary/10 text-primary rounded text-[10px] font-medium' : 'text-muted-foreground/40 text-[10px]'"
-          >C</span>
-          <span
-            :class="numLock ? 'px-1.5 py-0.5 bg-primary/10 text-primary rounded text-[10px] font-medium' : 'text-muted-foreground/40 text-[10px]'"
-          >N</span>
-          <span
-            :class="scrollLock ? 'px-1.5 py-0.5 bg-primary/10 text-primary rounded text-[10px] font-medium' : 'text-muted-foreground/40 text-[10px]'"
-          >S</span>
+      <div class="flex items-center justify-between gap-3 text-xs px-2 h-7">
+        <div v-if="keyboardLedEnabled && !minimal" class="flex items-center gap-1">
+          <Badge variant="outline" class="h-5 gap-1 px-1 text-xs text-foreground">
+            <span class="size-1.5 rounded-full" :class="capsLock ? 'bg-status-active' : 'bg-muted-foreground/30'" />Caps
+          </Badge>
+          <Badge variant="outline" class="h-5 gap-1 px-1 text-xs text-foreground">
+            <span class="size-1.5 rounded-full" :class="numLock ? 'bg-status-active' : 'bg-muted-foreground/30'" />Num
+          </Badge>
+          <Badge variant="outline" class="h-5 gap-1 px-1 text-xs text-foreground">
+            <span class="size-1.5 rounded-full" :class="scrollLock ? 'bg-status-active' : 'bg-muted-foreground/30'" />Scroll
+          </Badge>
         </div>
-        <div v-else class="text-[10px] text-muted-foreground/60">
+        <div v-else-if="!minimal" class="text-xs text-muted-foreground">
           {{ t('infobar.keyboardLedUnavailable') }}
         </div>
-        <div v-if="keysDisplay" class="text-[10px] text-muted-foreground truncate max-w-[200px]">
+        <span v-if="captured && minimal" class="min-w-0 truncate text-xs text-muted-foreground" :title="t('infobar.pointerCaptured')">{{ t('infobar.pointerCaptured') }}</span>
+        <div v-if="keysDisplay" class="text-xs text-muted-foreground truncate max-w-[200px]">
           {{ keysDisplay }}
         </div>
       </div>
@@ -71,7 +76,7 @@ const keysDisplay = computed(() => {
         <div class="flex items-center gap-4 px-3 py-1 min-w-0 flex-1">
           <div class="flex items-center gap-1.5 min-w-0">
             <span class="font-medium text-muted-foreground shrink-0">{{ t('infobar.keys') }}:</span>
-            <span class="text-foreground truncate">{{ keysDisplay || '-' }}</span>
+            <Kbd class="max-w-full truncate">{{ keysDisplay || '-' }}</Kbd>
           </div>
 
           <div v-if="debugMode && mousePosition" class="flex items-center gap-1.5 hidden md:flex">
@@ -82,25 +87,20 @@ const keysDisplay = computed(() => {
 
         <!-- Right side: Keyboard LED states -->
         <div class="flex items-center shrink-0">
+          <Separator orientation="vertical" class="h-5" />
           <template v-if="keyboardLedEnabled">
-            <div
-              :class="cn(
-                'px-2 py-1 select-none transition-colors',
-                capsLock ? 'text-foreground font-medium bg-primary/5' : 'text-muted-foreground/40'
-              )"
-            >{{ t('infobar.caps') }}</div>
-            <div
-              :class="cn(
-                'px-2 py-1 select-none transition-colors',
-                numLock ? 'text-foreground font-medium bg-primary/5' : 'text-muted-foreground/40'
-              )"
-            >{{ t('infobar.num') }}</div>
-            <div
-              :class="cn(
-                'px-2 py-1 select-none transition-colors',
-                scrollLock ? 'text-foreground font-medium bg-primary/5' : 'text-muted-foreground/40'
-              )"
-            >{{ t('infobar.scroll') }}</div>
+            <Badge variant="outline" class="mx-1 gap-1.5 text-foreground">
+              <span class="size-1.5 rounded-full" :class="capsLock ? 'bg-status-active' : 'bg-muted-foreground/30'" />
+              {{ t('infobar.caps') }}
+            </Badge>
+            <Badge variant="outline" class="mx-1 gap-1.5 text-foreground">
+              <span class="size-1.5 rounded-full" :class="numLock ? 'bg-status-active' : 'bg-muted-foreground/30'" />
+              {{ t('infobar.num') }}
+            </Badge>
+            <Badge variant="outline" class="mx-1 gap-1.5 text-foreground">
+              <span class="size-1.5 rounded-full" :class="scrollLock ? 'bg-status-active' : 'bg-muted-foreground/30'" />
+              {{ t('infobar.scroll') }}
+            </Badge>
           </template>
           <div v-else class="px-3 py-1 text-muted-foreground/60">
             {{ t('infobar.keyboardLedUnavailable') }}

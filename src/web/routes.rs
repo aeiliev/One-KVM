@@ -1,9 +1,14 @@
 #[cfg(unix)]
-use axum::{extract::DefaultBodyLimit, routing::delete};
 use axum::{
+    extract::DefaultBodyLimit,
+    routing::{delete, put},
+};
+use axum::{
+    http::StatusCode,
     middleware,
+    response::IntoResponse,
     routing::{any, get, patch, post},
-    Router,
+    Json, Router,
 };
 use std::sync::Arc;
 use tower_http::{
@@ -13,6 +18,8 @@ use tower_http::{
 
 use super::audio_ws::audio_ws_handler;
 use super::handlers;
+#[cfg(unix)]
+use super::uac_ws::uac_audio_ws_handler;
 use super::ws::ws_handler;
 use crate::auth::auth_middleware;
 use crate::hid::websocket::ws_hid_handler;
@@ -38,6 +45,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let public_routes = Router::new()
         .route("/health", get(handlers::health_check))
         .route("/auth/login", post(handlers::login))
+        .route("/auth/login/totp", post(handlers::login_totp))
         .route("/setup", get(handlers::setup_status))
         .route("/setup/init", post(handlers::setup_init));
 
@@ -48,7 +56,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/auth/check", get(handlers::auth_check))
         .route("/auth/password", post(handlers::change_password))
         .route("/auth/username", post(handlers::change_username))
+        .route("/auth/totp", get(handlers::totp_status))
+        .route(
+            "/auth/totp/enrollment",
+            post(handlers::begin_totp_enrollment),
+        )
+        .route(
+            "/auth/totp/enrollment/confirm",
+            post(handlers::confirm_totp_enrollment),
+        )
+        .route("/auth/totp/disable", post(handlers::disable_totp))
         .route("/devices", get(handlers::list_devices))
+        .route("/video/input-status", get(handlers::video_input_status))
         // WebSocket endpoint for real-time events
         .route("/ws", any(ws_handler))
         // Stream control endpoints
@@ -59,6 +78,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/stream/mode", post(handlers::stream_mode_set))
         .route("/stream/bitrate", post(handlers::stream_set_bitrate))
         .route("/stream/codecs", get(handlers::stream_codecs_list))
+        .route("/video/codecs", get(handlers::stream_codecs_list))
         .route("/stream/constraints", get(handlers::stream_constraints_get))
         .route(
             "/video/encoder/self-check",
@@ -73,6 +93,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/webrtc/close", post(handlers::webrtc_close_session))
         // HID endpoints
         .route("/hid/status", get(handlers::hid_status))
+        .route(
+            "/hid/bluetooth/adapters",
+            get(handlers::hid_bluetooth_adapters),
+        )
+        .route(
+            "/hid/bluetooth",
+            get(handlers::hid_bluetooth_status).post(handlers::hid_bluetooth_action),
+        )
         .route(
             "/hid/ch9329/descriptor",
             get(handlers::hid_ch9329_descriptor),
@@ -170,6 +198,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Web server configuration
         .route("/config/web", get(handlers::config::get_web_config))
         .route("/config/web", patch(handlers::config::update_web_config))
+        .route(
+            "/config/watchdog",
+            get(handlers::config::get_watchdog_config),
+        )
+        .route(
+            "/config/watchdog",
+            patch(handlers::config::update_watchdog_config),
+        )
         .route("/config/computer-use", get(handlers::computer_use_config))
         .route(
             "/config/computer-use",
@@ -243,9 +279,25 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     #[cfg(unix)]
     let user_routes = {
         user_routes
+            .route("/ws/uac-audio", any(uac_audio_ws_handler))
             .route("/hid/otg/self-check", get(handlers::hid_otg_self_check))
             .route("/config/msd", get(handlers::config::get_msd_config))
             .route("/config/msd", patch(handlers::config::update_msd_config))
+            .route("/config/otg", patch(handlers::config::update_otg_config))
+            .route(
+                "/config/otg-network",
+                get(handlers::config::get_otg_network_config),
+            )
+            .route(
+                "/config/otg-network",
+                patch(handlers::config::update_otg_network_config),
+            )
+            .route(
+                "/otg/network/status",
+                get(handlers::config::get_otg_network_status),
+            )
+            .route("/config/uac", get(handlers::config::get_uac_config))
+            .route("/config/uac", patch(handlers::config::update_uac_config))
             .route("/msd/status", get(handlers::msd_status))
             .route("/msd/images", get(handlers::msd_images_list))
             .route("/msd/images/download", post(handlers::msd_image_download))
@@ -255,10 +307,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             )
             .route("/msd/images/{id}", get(handlers::msd_image_get))
             .route("/msd/images/{id}", delete(handlers::msd_image_delete))
-            .route("/msd/connect", post(handlers::msd_connect))
-            .route("/msd/disconnect", post(handlers::msd_disconnect))
+            .route("/msd/disk-mode", put(handlers::msd_disk_mode_put))
+            .route("/msd/images/{id}/mount", post(handlers::msd_image_mount))
+            .route(
+                "/msd/images/{id}/mount",
+                delete(handlers::msd_image_unmount),
+            )
             .route("/msd/drive", get(handlers::msd_drive_info))
             .route("/msd/drive", delete(handlers::msd_drive_delete))
+            .route("/msd/drive/mount", post(handlers::msd_drive_mount))
+            .route("/msd/drive/mount", delete(handlers::msd_drive_unmount))
             .route("/msd/drive/init", post(handlers::msd_drive_init))
             .route("/msd/drive/files", get(handlers::msd_drive_files))
             .route(
@@ -271,6 +329,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             )
             .route("/msd/drive/mkdir/{*path}", post(handlers::msd_drive_mkdir))
             .route("/devices/usb", get(handlers::devices::list_usb_devices))
+            .route(
+                "/devices/network",
+                get(handlers::devices::list_network_interfaces),
+            )
             .route(
                 "/devices/usb/reset",
                 post(handlers::devices::reset_usb_device),
@@ -303,6 +365,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .merge(protected_routes)
         .merge(stream_routes)
         .merge(upload_routes)
+        .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -323,4 +386,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         Some(rf) => main_router.merge(rf),
         None => main_router,
     }
+}
+
+async fn api_not_found() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(super::ErrorResponse {
+            success: false,
+            code: None,
+            message: "Not Found".to_string(),
+        }),
+    )
 }

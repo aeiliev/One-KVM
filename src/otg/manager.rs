@@ -3,14 +3,15 @@ use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 
 use super::configfs::{
-    create_dir, create_symlink, find_udc, is_configfs_available, remove_dir, remove_file,
-    write_file, CONFIGFS_PATH, DEFAULT_GADGET_NAME, DEFAULT_USB_BCD_DEVICE, DEFAULT_USB_PRODUCT_ID,
+    configfs_path, create_dir, find_udc, is_configfs_available, remove_dir, write_file,
+    write_file_if_exists, DEFAULT_GADGET_NAME, DEFAULT_USB_BCD_DEVICE, DEFAULT_USB_PRODUCT_ID,
     DEFAULT_USB_VENDOR_ID, USB_BCD_USB,
 };
-use super::endpoint::{EndpointAllocator, DEFAULT_MAX_ENDPOINTS};
 use super::function::GadgetFunction;
 use super::hid::HidFunction;
-use super::msd::MsdFunction;
+use super::msd::{MsdFunction, MsdInquiryStrings};
+use super::network::NetworkFunction;
+use crate::config::OtgNetworkConfig;
 use crate::error::{AppError, Result};
 
 const REBIND_DELAY_MS: u64 = 300;
@@ -43,9 +44,10 @@ pub struct OtgGadgetManager {
     gadget_path: PathBuf,
     config_path: PathBuf,
     descriptor: GadgetDescriptor,
-    endpoint_allocator: EndpointAllocator,
     hid_instance: u8,
     msd_instance: u8,
+    network_instance: u8,
+    uac_instance: u8,
     functions: Vec<Box<dyn GadgetFunction>>,
     bound_udc: Option<String>,
     created_by_us: bool,
@@ -53,19 +55,15 @@ pub struct OtgGadgetManager {
 
 impl OtgGadgetManager {
     pub fn new() -> Self {
-        Self::with_config(DEFAULT_GADGET_NAME, DEFAULT_MAX_ENDPOINTS)
+        Self::with_config(DEFAULT_GADGET_NAME)
     }
 
-    pub fn with_config(gadget_name: &str, max_endpoints: u8) -> Self {
-        Self::with_descriptor(gadget_name, max_endpoints, GadgetDescriptor::default())
+    pub fn with_config(gadget_name: &str) -> Self {
+        Self::with_descriptor(gadget_name, GadgetDescriptor::default())
     }
 
-    pub fn with_descriptor(
-        gadget_name: &str,
-        max_endpoints: u8,
-        descriptor: GadgetDescriptor,
-    ) -> Self {
-        let gadget_path = PathBuf::from(CONFIGFS_PATH).join(gadget_name);
+    pub fn with_descriptor(gadget_name: &str, descriptor: GadgetDescriptor) -> Self {
+        let gadget_path = configfs_path().join(gadget_name);
         let config_path = gadget_path.join("configs/c.1");
 
         Self {
@@ -73,9 +71,10 @@ impl OtgGadgetManager {
             gadget_path,
             config_path,
             descriptor,
-            endpoint_allocator: EndpointAllocator::new(max_endpoints),
             hid_instance: 0,
             msd_instance: 0,
+            network_instance: 0,
+            uac_instance: 0,
             functions: Vec::with_capacity(4),
             bound_udc: None,
             created_by_us: false,
@@ -135,30 +134,36 @@ impl OtgGadgetManager {
         Ok(device_path)
     }
 
-    pub fn add_msd(&mut self) -> Result<MsdFunction> {
-        let func = MsdFunction::new(self.msd_instance);
+    pub fn add_msd(
+        &mut self,
+        lun_capacity: u8,
+        inquiry_strings: MsdInquiryStrings,
+    ) -> Result<MsdFunction> {
+        let func = MsdFunction::new(self.msd_instance, lun_capacity, inquiry_strings)?;
         let func_clone = func.clone();
         self.add_function(Box::new(func))?;
         self.msd_instance += 1;
         Ok(func_clone)
     }
 
+    pub fn add_network(&mut self, config: &OtgNetworkConfig) -> Result<NetworkFunction> {
+        let func = NetworkFunction::new(self.network_instance, config)?;
+        let func_clone = func.clone();
+        self.add_function(Box::new(func))?;
+        self.network_instance += 1;
+        Ok(func_clone)
+    }
+
+    pub fn add_uac(&mut self, sample_rate: u32, channels: u8) -> Result<super::uac::UacFunction> {
+        let func = super::uac::UacFunction::new(self.uac_instance, sample_rate, channels)?;
+        let func_clone = func.clone();
+        self.add_function(Box::new(func))?;
+        self.uac_instance += 1;
+        Ok(func_clone)
+    }
+
     fn add_function(&mut self, func: Box<dyn GadgetFunction>) -> Result<()> {
-        let endpoints = func.endpoints_required();
-
-        if !self.endpoint_allocator.can_allocate(endpoints) {
-            return Err(AppError::Internal(format!(
-                "Not enough endpoints for function {}: need {}, available {}",
-                func.name(),
-                endpoints,
-                self.endpoint_allocator.available()
-            )));
-        }
-
-        self.endpoint_allocator.allocate(endpoints)?;
-
         self.functions.push(func);
-
         Ok(())
     }
 
@@ -166,9 +171,10 @@ impl OtgGadgetManager {
         debug!("Setting up OTG USB Gadget: {}", self.gadget_name);
 
         if !Self::is_available() {
-            return Err(AppError::Internal(
-                "ConfigFS not available. Is it mounted at /sys/kernel/config?".to_string(),
-            ));
+            return Err(AppError::Internal(format!(
+                "ConfigFS not available at {}",
+                configfs_path().display()
+            )));
         }
 
         if self.gadget_exists() {
@@ -194,14 +200,28 @@ impl OtgGadgetManager {
             func.link(&self.config_path, &self.gadget_path)?;
         }
 
+        // A host only enables USB remote wakeup when the configuration
+        // descriptor advertises it. Enable the descriptor bit only when the
+        // running kernel supports the HID wakeup_on_write attribute.
+        let hid_wakeup_supported = self.functions.iter().any(|func| {
+            func.name().starts_with("hid.")
+                && self
+                    .gadget_path
+                    .join("functions")
+                    .join(func.name())
+                    .join("wakeup_on_write")
+                    .exists()
+        });
+        if hid_wakeup_supported {
+            let _ = write_file_if_exists(&self.config_path.join("bmAttributes"), "0xA0")?;
+        }
+
         debug!("OTG USB Gadget setup complete");
         Ok(())
     }
 
     pub fn bind(&mut self, udc: &str) -> Result<()> {
-        if let Err(e) = self.recreate_config_links() {
-            warn!("Failed to recreate gadget config links before bind: {}", e);
-        }
+        self.recreate_config_links()?;
 
         debug!("Binding gadget to UDC: {}", udc);
         write_file(&self.gadget_path.join("UDC"), &udc)?;
@@ -223,30 +243,51 @@ impl OtgGadgetManager {
 
     pub fn cleanup(&mut self) -> Result<()> {
         if !self.gadget_exists() {
+            self.created_by_us = false;
             return Ok(());
         }
 
         info!("Cleaning up OTG USB Gadget: {}", self.gadget_name);
+        let mut errors = Vec::new();
 
-        let _ = self.unbind();
+        if let Err(error) = self.unbind() {
+            errors.push(format!("unbind failed: {error}"));
+        }
 
         for func in self.functions.iter().rev() {
-            let _ = func.unlink(&self.config_path);
+            if let Err(error) = func.unlink(&self.config_path) {
+                errors.push(format!("unlink {} failed: {error}", func.name()));
+            }
         }
 
         let config_strings = self.config_path.join("strings/0x409");
-        let _ = remove_dir(&config_strings);
-        let _ = remove_dir(&self.config_path);
+        if let Err(error) = remove_dir(&config_strings) {
+            errors.push(error.to_string());
+        }
+        if let Err(error) = remove_dir(&self.config_path) {
+            errors.push(error.to_string());
+        }
 
         for func in self.functions.iter().rev() {
-            let _ = func.cleanup(&self.gadget_path);
+            if let Err(error) = func.cleanup(&self.gadget_path) {
+                errors.push(format!("cleanup {} failed: {error}", func.name()));
+            }
         }
 
         let gadget_strings = self.gadget_path.join("strings/0x409");
-        let _ = remove_dir(&gadget_strings);
+        if let Err(error) = remove_dir(&gadget_strings) {
+            errors.push(error.to_string());
+        }
 
-        if let Err(e) = remove_dir(&self.gadget_path) {
-            warn!("Could not remove gadget directory: {}", e);
+        if let Err(error) = remove_dir(&self.gadget_path) {
+            errors.push(error.to_string());
+        }
+
+        if !errors.is_empty() {
+            return Err(AppError::Config(format!(
+                "OTG gadget cleanup incomplete: {}",
+                errors.join("; ")
+            )));
         }
 
         self.created_by_us = false;
@@ -312,12 +353,21 @@ impl OtgGadgetManager {
     }
 
     fn configuration_label(&self) -> &'static str {
-        if self
+        let has_msd = self
             .functions
             .iter()
-            .any(|func| func.name().starts_with("mass_storage."))
-        {
+            .any(|func| func.name().starts_with("mass_storage."));
+        let has_network = self.functions.iter().any(|func| {
+            ["ncm.", "ecm.", "rndis."]
+                .iter()
+                .any(|prefix| func.name().starts_with(prefix))
+        });
+        if has_msd && has_network {
+            "Config 1: HID + MSD + NET"
+        } else if has_msd {
             "Config 1: HID + MSD"
+        } else if has_network {
+            "Config 1: HID + NET"
         } else {
             "Config 1: HID"
         }
@@ -333,39 +383,22 @@ impl OtgGadgetManager {
             return Ok(());
         }
 
-        let entries = std::fs::read_dir(&functions_path).map_err(|e| {
-            AppError::Internal(format!(
-                "Failed to read functions directory {}: {}",
-                functions_path.display(),
-                e
-            ))
-        })?;
-
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = match name.to_str() {
-                Some(n) => n,
-                None => continue,
-            };
-            if !name.contains(".usb") {
-                continue;
+        // ConfigFS binds functions in link insertion order. Preserve the
+        // setup order (UAC before HID), including on rebind: directory
+        // iteration order is unspecified and can change endpoint allocation.
+        for func in &self.functions {
+            let dest = self.config_path.join(func.name());
+            if dest.symlink_metadata().is_ok() {
+                fs::remove_file(&dest).map_err(|error| {
+                    AppError::Internal(format!(
+                        "Failed to remove config link {}: {error}",
+                        dest.display()
+                    ))
+                })?;
             }
-
-            let src = functions_path.join(name);
-            let dest = self.config_path.join(name);
-
-            if dest.exists() {
-                if let Err(e) = remove_file(&dest) {
-                    warn!(
-                        "Failed to remove existing config link {}: {}",
-                        dest.display(),
-                        e
-                    );
-                    continue;
-                }
-            }
-
-            create_symlink(&src, &dest)?;
+        }
+        for func in &self.functions {
+            func.link(&self.config_path, &self.gadget_path)?;
         }
 
         Ok(())
@@ -418,6 +451,81 @@ pub async fn wait_for_hid_devices(device_paths: &[PathBuf], timeout_ms: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordedFunction {
+        name: &'static str,
+        links: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl GadgetFunction for RecordedFunction {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn create(&self, _: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn link(&self, config: &Path, gadget: &Path) -> Result<()> {
+            super::super::configfs::create_symlink(
+                &gadget.join("functions").join(self.name),
+                &config.join(self.name),
+            )?;
+            self.links.lock().unwrap().push(self.name.into());
+            Ok(())
+        }
+        fn unlink(&self, _: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn cleanup(&self, _: &Path) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn rebind_links_uac_before_hid_in_registration_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = OtgGadgetManager::new();
+        manager.gadget_path = temp.path().to_path_buf();
+        manager.config_path = temp.path().join("configs/c.1");
+        fs::create_dir_all(&manager.config_path).unwrap();
+        let links = Arc::new(Mutex::new(Vec::new()));
+        for name in ["uac1.usb0", "hid.usb0", "mass_storage.usb0"] {
+            fs::create_dir_all(temp.path().join("functions").join(name)).unwrap();
+            // Include a dangling pre-existing link, as well as testing rebind.
+            std::os::unix::fs::symlink("/nonexistent-uac-test", manager.config_path.join(name))
+                .unwrap();
+            manager
+                .add_function(Box::new(RecordedFunction {
+                    name,
+                    links: Arc::clone(&links),
+                }))
+                .unwrap();
+        }
+        for _ in 0..2 {
+            links.lock().unwrap().clear();
+            manager.recreate_config_links().unwrap();
+            assert_eq!(
+                *links.lock().unwrap(),
+                ["uac1.usb0", "hid.usb0", "mass_storage.usb0"]
+            );
+        }
+    }
+
+    #[test]
+    fn link_failure_prevents_udc_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = OtgGadgetManager::new();
+        manager.gadget_path = temp.path().to_path_buf();
+        manager.config_path = temp.path().join("configs/c.1");
+        fs::create_dir_all(temp.path().join("functions/hid.usb0")).unwrap();
+        // A directory occupying a config link cannot be removed as a file.
+        fs::create_dir_all(manager.config_path.join("hid.usb0")).unwrap();
+        fs::write(temp.path().join("UDC"), "").unwrap();
+        manager.add_keyboard(false).unwrap();
+        assert!(manager.bind("test-udc").is_err());
+        assert_eq!(fs::read_to_string(temp.path().join("UDC")).unwrap(), "");
+    }
 
     #[test]
     fn test_manager_creation() {
@@ -427,14 +535,12 @@ mod tests {
     }
 
     #[test]
-    fn test_endpoint_tracking() {
-        let mut manager = OtgGadgetManager::with_config("test", 8);
+    fn test_function_selection_is_not_prevalidated() {
+        let mut manager = OtgGadgetManager::with_config("test");
 
-        let _ = manager.add_keyboard(false);
-        assert_eq!(manager.endpoint_allocator.used(), 1);
-
-        let _ = manager.add_mouse_relative();
-        let _ = manager.add_mouse_absolute();
-        assert_eq!(manager.endpoint_allocator.used(), 3);
+        assert!(manager.add_keyboard(false).is_ok());
+        assert!(manager.add_mouse_relative().is_ok());
+        assert!(manager.add_mouse_absolute().is_ok());
+        assert_eq!(manager.functions.len(), 3);
     }
 }

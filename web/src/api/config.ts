@@ -10,6 +10,12 @@ import type {
   HidConfigUpdate,
   MsdConfig,
   MsdConfigUpdate,
+  NetworkInterfaceInfo,
+  OtgNetworkConfig,
+  OtgNetworkConfigUpdate,
+  OtgNetworkStatus,
+  OtgConfigUpdate,
+  OtgConfigResponse,
   AtxConfig,
   AtxConfigUpdate,
   AtxDevices,
@@ -28,12 +34,24 @@ import type {
   FrpcConfigUpdate,
   WebConfigResponse,
   WebConfigUpdate,
+  WatchdogConfigResponse,
+  WatchdogConfigUpdate,
 } from '@/types/generated'
 
 import { request } from './request'
 
 export const configApi = {
   getAll: () => request<AppConfig>('/config'),
+}
+
+export const watchdogConfigApi = {
+  get: () => request<WatchdogConfigResponse>('/config/watchdog', {}, { toastOnError: false }),
+
+  update: (config: WatchdogConfigUpdate) =>
+    request<WatchdogConfigResponse>('/config/watchdog', {
+      method: 'PATCH',
+      body: JSON.stringify(config),
+    }, { toastOnError: false }),
 }
 
 export const authConfigApi = {
@@ -69,8 +87,9 @@ export const streamConfigApi = {
 export const hidConfigApi = {
   get: () => request<HidConfig>('/config/hid'),
 
-  update: (config: HidConfigUpdate) =>
+  update: (config: HidConfigUpdate, signal?: AbortSignal) =>
     request<HidConfig>('/config/hid', {
+      signal,
       method: 'PATCH',
       body: JSON.stringify(config),
     }),
@@ -81,6 +100,38 @@ export const msdConfigApi = {
 
   update: (config: MsdConfigUpdate) =>
     request<MsdConfig>('/config/msd', {
+      method: 'PATCH',
+      body: JSON.stringify(config),
+    }),
+}
+
+export const otgNetworkApi = {
+  get: () => request<OtgNetworkConfig>('/config/otg-network'),
+
+  update: (config: OtgNetworkConfigUpdate) =>
+    request<OtgNetworkConfig>('/config/otg-network', {
+      method: 'PATCH',
+      body: JSON.stringify(config),
+    }),
+
+  status: () => request<OtgNetworkStatus>('/otg/network/status'),
+
+  interfaces: () => request<NetworkInterfaceInfo[]>('/devices/network', {}, { toastOnError: false }),
+}
+
+export const uacApi = {
+  get: () => request<{enabled: boolean; sample_rate: number; channels: number}>('/config/uac'),
+
+  update: (config: {enabled: boolean; sample_rate: number; channels: number}) =>
+    request('/config/uac', {
+      method: 'PATCH',
+      body: JSON.stringify(config),
+    }),
+}
+
+export const otgConfigApi = {
+  update: (config: OtgConfigUpdate) =>
+    request<OtgConfigResponse>('/config/otg', {
       method: 'PATCH',
       body: JSON.stringify(config),
     }),
@@ -171,12 +222,13 @@ export const extensionsApi = {
 
 export interface RustDeskConfigResponse {
   enabled: boolean
+  mode: 'id' | 'direct_ip'
   codec: 'h264' | 'h265'
+  direct_access_port: number
   rendezvous_server: string
   relay_server: string | null
   device_id: string
   has_password: boolean
-  has_keypair: boolean
   relay_key: string | null
 }
 
@@ -184,11 +236,16 @@ export interface RustDeskStatusResponse {
   config: RustDeskConfigResponse
   service_status: string
   rendezvous_status: string | null
+  connection_count: number
+  listening: boolean
+  listen_port: number | null
 }
 
 export interface RustDeskConfigUpdate {
   enabled?: boolean
+  mode?: 'id' | 'direct_ip'
   codec?: 'h264' | 'h265'
+  direct_access_port?: number
   rendezvous_server?: string
   relay_server?: string
   relay_key?: string

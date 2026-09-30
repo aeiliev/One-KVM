@@ -6,6 +6,7 @@ import {
   audioConfigApi,
   hidConfigApi,
   msdConfigApi,
+  otgConfigApi,
   rtspConfigApi,
   rustdeskConfigApi,
   streamConfigApi,
@@ -24,6 +25,8 @@ import type {
   HidConfigUpdate,
   MsdConfig,
   MsdConfigUpdate,
+  OtgConfigResponse,
+  OtgConfigUpdate,
   StreamConfigResponse,
   StreamConfigUpdate,
   VideoConfig,
@@ -513,8 +516,8 @@ export const useConfigStore = defineStore('config', () => {
     return response
   }
 
-  async function updateHid(update: HidConfigUpdate) {
-    const response = await hidConfigApi.update(update)
+  async function updateHid(update: HidConfigUpdate, signal?: AbortSignal) {
+    const response = await hidConfigApi.update(update, signal)
     hid.value = response
     return response
   }
@@ -522,6 +525,13 @@ export const useConfigStore = defineStore('config', () => {
   async function updateMsd(update: MsdConfigUpdate) {
     const response = await msdConfigApi.update(update)
     msd.value = response
+    return response
+  }
+
+  async function updateOtg(update: OtgConfigUpdate): Promise<OtgConfigResponse> {
+    const response = await otgConfigApi.update(update)
+    hid.value = response.hid
+    msd.value = response.msd
     return response
   }
 
@@ -642,6 +652,7 @@ export const useConfigStore = defineStore('config', () => {
     updateAudio,
     updateHid,
     updateMsd,
+    updateOtg,
     updateStream,
     updateWeb,
     updateAtx,

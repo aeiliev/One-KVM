@@ -3,10 +3,12 @@ use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
 use crate::atx::AtxController;
 use crate::audio::AudioController;
-use crate::auth::{SessionStore, UserStore};
+use crate::auth::{SessionStore, TwoFactorService, UserStore};
 use crate::computer_use::ComputerUseManager;
 use crate::config::ConfigStore;
 use crate::db::DatabasePool;
+#[cfg(unix)]
+use crate::events::MsdDeviceMediaInfo;
 use crate::events::{
     AtxDeviceInfo, AudioDeviceInfo, EventBus, HidDeviceInfo, LedState, MsdDeviceInfo, SystemEvent,
     TtydDeviceInfo, VideoDeviceInfo,
@@ -17,11 +19,10 @@ use crate::hid::HidController;
 use crate::msd::MsdController;
 #[cfg(unix)]
 use crate::otg::OtgService;
-use crate::rtsp::RtspService;
-use crate::rustdesk::RustDeskService;
+use crate::runtime::{RemoteAccessCoordinator, UsbCoordinator};
 use crate::update::UpdateService;
 use crate::video::VideoStreamManager;
-use crate::vnc::VncService;
+use crate::watchdog::WatchdogController;
 use crate::webrtc::WebRtcStreamer;
 
 #[derive(Clone)]
@@ -34,6 +35,7 @@ pub struct ConfigApplyLocks {
     pub rustdesk: Arc<Mutex<()>>,
     pub vnc: Arc<Mutex<()>>,
     pub rtsp: Arc<Mutex<()>>,
+    pub watchdog: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +55,7 @@ impl ConfigApplyLocks {
             rustdesk: Arc::new(Mutex::new(())),
             vnc: Arc::new(Mutex::new(())),
             rtsp: Arc::new(Mutex::new(())),
+            watchdog: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -63,6 +66,7 @@ pub struct AppState {
     pub config: ConfigStore,
     pub sessions: SessionStore,
     pub users: UserStore,
+    pub two_factor: TwoFactorService,
     #[cfg(unix)]
     pub otg_service: Arc<OtgService>,
     pub stream_manager: Arc<VideoStreamManager>,
@@ -73,13 +77,15 @@ pub struct AppState {
     pub msd: Arc<RwLock<Option<MsdController>>>,
     pub atx: Arc<RwLock<Option<AtxController>>>,
     pub audio: Arc<AudioController>,
-    pub rustdesk: Arc<RwLock<Option<Arc<RustDeskService>>>>,
-    pub vnc: Arc<RwLock<Option<Arc<VncService>>>>,
-    pub rtsp: Arc<RwLock<Option<Arc<RtspService>>>>,
+    #[cfg(unix)]
+    pub uac_playback: Arc<RwLock<Option<crate::audio::uac::UacPlayback>>>,
+    pub usb: Arc<UsbCoordinator>,
+    pub remote_access: Arc<RemoteAccessCoordinator>,
     pub extensions: Arc<ExtensionManager>,
     pub events: Arc<EventBus>,
     device_info_tx: watch::Sender<Option<SystemEvent>>,
     pub update: Arc<UpdateService>,
+    pub watchdog: Arc<WatchdogController>,
     pub shutdown_tx: broadcast::Sender<ShutdownAction>,
     pub revoked_sessions: Arc<RwLock<VecDeque<String>>>,
     pub config_apply_locks: ConfigApplyLocks,
@@ -93,6 +99,7 @@ impl AppState {
         config: ConfigStore,
         sessions: SessionStore,
         users: UserStore,
+        two_factor: TwoFactorService,
         #[cfg(unix)] otg_service: Arc<OtgService>,
         stream_manager: Arc<VideoStreamManager>,
         webrtc: Arc<WebRtcStreamer>,
@@ -101,9 +108,6 @@ impl AppState {
         #[cfg(unix)] msd: Option<MsdController>,
         atx: Option<AtxController>,
         audio: Arc<AudioController>,
-        rustdesk: Option<Arc<RustDeskService>>,
-        vnc: Option<Arc<VncService>>,
-        rtsp: Option<Arc<RtspService>>,
         extensions: Arc<ExtensionManager>,
         events: Arc<EventBus>,
         update: Arc<UpdateService>,
@@ -112,11 +116,34 @@ impl AppState {
     ) -> Arc<Self> {
         let (device_info_tx, _device_info_rx) = watch::channel(None);
 
+        let remote_access = RemoteAccessCoordinator::new(
+            config.clone(),
+            stream_manager.clone(),
+            hid.clone(),
+            audio.clone(),
+        );
+        #[cfg(unix)]
+        let msd = Arc::new(RwLock::new(msd));
+        #[cfg(unix)]
+        let uac_playback = Arc::new(RwLock::new(None));
+        let usb = UsbCoordinator::new(
+            hid.clone(),
+            #[cfg(unix)]
+            otg_service.clone(),
+            #[cfg(unix)]
+            msd.clone(),
+            #[cfg(unix)]
+            uac_playback.clone(),
+            events.clone(),
+            data_dir.clone(),
+        );
+
         Arc::new(Self {
             db,
             config,
             sessions,
             users,
+            two_factor,
             #[cfg(unix)]
             otg_service,
             stream_manager,
@@ -124,20 +151,22 @@ impl AppState {
             hid,
             computer_use,
             #[cfg(unix)]
-            msd: Arc::new(RwLock::new(msd)),
+            msd,
             atx: Arc::new(RwLock::new(atx)),
             audio,
-            rustdesk: Arc::new(RwLock::new(rustdesk)),
-            vnc: Arc::new(RwLock::new(vnc)),
-            rtsp: Arc::new(RwLock::new(rtsp)),
+            usb,
+            remote_access,
             extensions,
             events,
             device_info_tx,
             update,
+            watchdog: Arc::new(WatchdogController::new()),
             shutdown_tx,
             revoked_sessions: Arc::new(RwLock::new(VecDeque::new())),
             config_apply_locks: ConfigApplyLocks::new(),
             data_dir,
+            #[cfg(unix)]
+            uac_playback,
         })
     }
 
@@ -189,6 +218,11 @@ impl AppState {
 
     pub async fn publish_device_info(&self) {
         let device_info = self.get_device_info().await;
+        if let SystemEvent::DeviceInfo { video, .. } = &device_info {
+            if let Some((width, height)) = video.resolution {
+                self.hid.set_screen_resolution(width, height).await;
+            }
+        }
         let _ = self.device_info_tx.send(Some(device_info));
     }
 
@@ -231,16 +265,33 @@ impl AppState {
 
             let state = msd.state().await;
             let error = msd.monitor().error_message().await;
+            let mounted_media = state
+                .mounted_media
+                .iter()
+                .map(|media| MsdDeviceMediaInfo {
+                    id: media.id.clone(),
+                    kind: match media.kind {
+                        crate::msd::MountedMediaKind::Drive => "drive",
+                        crate::msd::MountedMediaKind::Image => "image",
+                    }
+                    .to_string(),
+                    name: media.name.clone(),
+                    cdrom: media.cdrom,
+                    read_only: media.read_only,
+                    size: media.size,
+                })
+                .collect::<Vec<_>>();
             Some(MsdDeviceInfo {
                 available: state.available,
-                mode: match state.mode {
-                    crate::msd::MsdMode::None => "none",
-                    crate::msd::MsdMode::Image => "image",
-                    crate::msd::MsdMode::Drive => "drive",
+                disk_mode: match state.disk_mode {
+                    crate::msd::DiskMode::Single => "single",
+                    crate::msd::DiskMode::Multi => "multi",
                 }
                 .to_string(),
-                connected: state.connected,
-                image_id: state.current_image.map(|img| img.id),
+                slot_capacity: state.disk_mode.capacity(),
+                mounted_count: state.mounted_media.len() as u8,
+                mounted_media,
+                usb_reenumerating: state.usb_reenumerating,
                 error,
             })
         }

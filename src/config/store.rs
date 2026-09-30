@@ -17,23 +17,26 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
-    pub fn new(pool: Pool<Sqlite>) -> Result<Self> {
-        Ok(Self {
+    pub fn new(pool: Pool<Sqlite>) -> Self {
+        Self {
             pool,
             cache: Arc::new(ArcSwap::from_pointee(AppConfig::default())),
             change_tx: broadcast::channel(16).0,
             write_lock: Arc::new(Mutex::new(())),
-        })
+        }
     }
 
     pub async fn load(&self) -> Result<()> {
-        let mut config = Self::load_config(&self.pool).await?;
+        let (mut config, removed_legacy_totp) = Self::load_config(&self.pool).await?;
         config.enforce_invariants();
+        if removed_legacy_totp {
+            Self::save_config_to_db(&self.pool, &config).await?;
+        }
         self.cache.store(Arc::new(config));
         Ok(())
     }
 
-    async fn load_config(pool: &Pool<Sqlite>) -> Result<AppConfig> {
+    async fn load_config(pool: &Pool<Sqlite>) -> Result<(AppConfig, bool)> {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT value FROM config WHERE key = 'app_config'")
                 .fetch_optional(pool)
@@ -41,12 +44,24 @@ impl ConfigStore {
 
         match row {
             Some((json,)) => {
-                serde_json::from_str(&json).map_err(|e| AppError::Config(e.to_string()))
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&json).map_err(|e| AppError::Config(e.to_string()))?;
+                let mut removed = false;
+                if let Some(auth) = value
+                    .get_mut("auth")
+                    .and_then(|value| value.as_object_mut())
+                {
+                    removed |= auth.remove("totp_enabled").is_some();
+                    removed |= auth.remove("totp_secret").is_some();
+                }
+                let config =
+                    serde_json::from_value(value).map_err(|e| AppError::Config(e.to_string()))?;
+                Ok((config, removed))
             }
             None => {
                 let config = AppConfig::default();
                 Self::save_config_to_db(pool, &config).await?;
-                Ok(config)
+                Ok((config, false))
             }
         }
     }
@@ -66,6 +81,11 @@ impl ConfigStore {
         .await?;
 
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn hid_bonds(&self) -> crate::db::hid_bonds::HidBondStore {
+        crate::db::hid_bonds::HidBondStore(self.pool.clone())
     }
 
     pub fn get(&self) -> Arc<AppConfig> {
@@ -130,7 +150,7 @@ mod tests {
         let db = DatabasePool::new(&db_path).await.unwrap();
         db.init_schema().await.unwrap();
 
-        let store = ConfigStore::new(db.clone_pool()).unwrap();
+        let store = ConfigStore::new(db.clone_pool());
         store.load().await.unwrap();
 
         let config = store.get();
@@ -148,10 +168,61 @@ mod tests {
         assert!(config.initialized);
         assert_eq!(config.web.http_port, 9000);
 
-        let store2 = ConfigStore::new(db.clone_pool()).unwrap();
+        let store2 = ConfigStore::new(db.clone_pool());
         store2.load().await.unwrap();
         let config = store2.get();
         assert!(config.initialized);
         assert_eq!(config.web.http_port, 9000);
+    }
+
+    #[tokio::test]
+    async fn failed_watchdog_persistence_does_not_update_cache() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = DatabasePool::new(&db_path).await.unwrap();
+        db.init_schema().await.unwrap();
+        let store = ConfigStore::new(db.clone_pool());
+        store.load().await.unwrap();
+
+        sqlx::query("DROP TABLE config")
+            .execute(&db.clone_pool())
+            .await
+            .unwrap();
+        assert!(store
+            .update(|config| config.watchdog.enabled = true)
+            .await
+            .is_err());
+        assert!(!store.get().watchdog.enabled);
+    }
+
+    #[tokio::test]
+    async fn load_removes_legacy_totp_fields_from_persisted_config() {
+        let dir = tempdir().unwrap();
+        let db = DatabasePool::new(&dir.path().join("test.db"))
+            .await
+            .unwrap();
+        db.init_schema().await.unwrap();
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        let auth = value.get_mut("auth").unwrap().as_object_mut().unwrap();
+        auth.insert("totp_enabled".to_string(), serde_json::json!(true));
+        auth.insert(
+            "totp_secret".to_string(),
+            serde_json::json!("legacy-secret"),
+        );
+        sqlx::query("INSERT INTO config (key, value) VALUES ('app_config', ?1)")
+            .bind(value.to_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let store = ConfigStore::new(db.clone_pool());
+        store.load().await.unwrap();
+        let (persisted,): (String,) =
+            sqlx::query_as("SELECT value FROM config WHERE key = 'app_config'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(!persisted.contains("totp_enabled"));
+        assert!(!persisted.contains("totp_secret"));
     }
 }

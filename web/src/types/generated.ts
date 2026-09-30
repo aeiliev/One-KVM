@@ -5,8 +5,6 @@
 export interface AuthConfig {
 	session_timeout_secs: number;
 	single_user_allow_multiple_sessions: boolean;
-	totp_enabled: boolean;
-	totp_secret?: string;
 }
 
 export interface VideoConfig {
@@ -18,9 +16,16 @@ export interface VideoConfig {
 	quality: number;
 }
 
+export interface BluetoothHidConfig {
+	adapter: string;
+	name: string;
+	peer?: string;
+}
+
 export enum HidBackend {
 	Otg = "otg",
 	Ch9329 = "ch9329",
+	Bluetooth = "bluetooth",
 	None = "none",
 }
 
@@ -40,13 +45,6 @@ export enum OtgHidProfile {
 	Custom = "custom",
 }
 
-export enum OtgEndpointBudget {
-	Auto = "auto",
-	Five = "five",
-	Six = "six",
-	Unlimited = "unlimited",
-}
-
 export interface OtgHidFunctions {
 	keyboard: boolean;
 	mouse_relative: boolean;
@@ -63,23 +61,42 @@ export interface Ch9329DescriptorConfig {
 }
 
 export interface HidConfig {
+	bluetooth: BluetoothHidConfig;
 	backend: HidBackend;
 	otg_udc?: string;
 	otg_descriptor?: OtgDescriptorConfig;
 	otg_profile?: OtgHidProfile;
-	otg_endpoint_budget?: OtgEndpointBudget;
 	otg_functions?: OtgHidFunctions;
 	otg_keyboard_leds?: boolean;
 	ch9329_port: string;
 	ch9329_baudrate: number;
 	ch9329_hybrid_mouse?: boolean;
+	mouse_macos_drag?: boolean;
 	ch9329_descriptor?: Ch9329DescriptorConfig;
 	mouse_absolute: boolean;
+}
+
+export enum OtgNetworkDriverMode {
+	Ncm = "ncm",
+	Ecm = "ecm",
+	Rndis = "rndis",
+}
+
+export interface OtgNetworkConfig {
+	enabled: boolean;
+	driver_mode: OtgNetworkDriverMode;
+	/** Empty means select the connected NetworkManager Ethernet interface. */
+	bridge_interface: string;
+	/** Empty values are resolved from the machine identity at runtime. */
+	host_mac: string;
+	device_mac: string;
 }
 
 export interface MsdConfig {
 	enabled: boolean;
 	msd_dir: string;
+	flash_inquiry_string: string;
+	cdrom_inquiry_string: string;
 }
 
 export enum AtxDriverType {
@@ -170,11 +187,8 @@ export interface WebConfig {
 
 export interface ComputerUseConfig {
 	enabled: boolean;
-	provider: string;
 	base_url: string;
 	model: string;
-	max_steps: number;
-	timeout_seconds: number;
 }
 
 export interface TtydConfig {
@@ -189,12 +203,19 @@ export interface GostcConfig {
 	tls: boolean;
 }
 
+export enum EasytierConfigMode {
+	Quick = "quick",
+	Full = "full",
+}
+
 export interface EasytierConfig {
 	enabled: boolean;
+	config_mode: EasytierConfigMode;
 	network_name: string;
 	network_secret: string;
 	peer_urls: string[];
 	virtual_ip?: string;
+	custom_toml: string;
 }
 
 export enum FrpcConfigMode {
@@ -236,6 +257,11 @@ export interface ExtensionsConfig {
 	frpc: FrpcConfig;
 }
 
+export enum RustDeskMode {
+	Id = "id",
+	DirectIp = "direct_ip",
+}
+
 export enum RustDeskCodec {
 	H264 = "h264",
 	H265 = "h265",
@@ -243,7 +269,9 @@ export enum RustDeskCodec {
 
 export interface RustDeskConfig {
 	enabled: boolean;
+	mode: RustDeskMode;
 	codec: RustDeskCodec;
+	direct_access_port: number;
 	rendezvous_server: string;
 	relay_server?: string;
 	device_id: string;
@@ -259,7 +287,6 @@ export interface VncConfig {
 	bind: string;
 	port: number;
 	encoding: VncEncoding;
-	jpeg_quality: number;
 	allow_one_client: boolean;
 }
 
@@ -282,11 +309,23 @@ export interface RedfishConfig {
 	enabled: boolean;
 }
 
+export interface WatchdogConfig {
+	enabled: boolean;
+}
+
+/** Configuration for the USB Audio Class microphone gadget. */
+export interface UacConfig {
+	enabled: boolean;
+	sample_rate: number;
+	channels: number;
+}
+
 export interface AppConfig {
 	initialized: boolean;
 	auth: AuthConfig;
 	video: VideoConfig;
 	hid: HidConfig;
+	otg_network: OtgNetworkConfig;
 	msd: MsdConfig;
 	atx: AtxConfig;
 	audio: AudioConfig;
@@ -298,6 +337,8 @@ export interface AppConfig {
 	vnc: VncConfig;
 	rtsp: RtspConfig;
 	redfish: RedfishConfig;
+	watchdog: WatchdogConfig;
+	uac: UacConfig;
 }
 
 /** Update for a single ATX output binding */
@@ -368,11 +409,8 @@ export interface Ch9329DescriptorState {
 
 export interface ComputerUseConfigResponse {
 	enabled: boolean;
-	provider: string;
 	base_url: string;
 	model: string;
-	max_steps: number;
-	timeout_seconds: number;
 	api_key_configured: boolean;
 	api_key_source: string;
 }
@@ -381,10 +419,8 @@ export interface ComputerUseConfigUpdate {
 	enabled?: boolean;
 	base_url?: string;
 	model?: string;
-	max_steps?: number;
-	timeout_seconds?: number;
-	openai_api_key?: string;
-	clear_openai_api_key?: boolean;
+	api_key?: string;
+	clear_api_key?: boolean;
 }
 
 export interface ComputerUsePoint {
@@ -413,7 +449,6 @@ export interface ComputerUseSessionSummary {
 	status: ComputerUseSessionStatus;
 	prompt?: string;
 	step: number;
-	max_steps: number;
 	last_error?: string;
 	final_message?: string;
 }
@@ -422,16 +457,16 @@ export interface ComputerUseStartRequest {
 	prompt: string;
 	continue_conversation?: boolean;
 	client_id: string;
-	max_steps?: number;
-	timeout_seconds?: number;
 }
 
 export interface EasytierConfigUpdate {
 	enabled?: boolean;
+	config_mode?: EasytierConfigMode;
 	network_name?: string;
 	network_secret?: string;
 	peer_urls?: string[];
 	virtual_ip?: string;
+	custom_toml?: string;
 }
 
 export type ExtensionStatus = 
@@ -530,15 +565,17 @@ export interface OtgHidFunctionsUpdate {
 }
 
 export interface HidConfigUpdate {
+	bluetooth_reset_pairing?: boolean;
+	bluetooth?: BluetoothHidConfig;
 	backend?: HidBackend;
 	ch9329_port?: string;
 	ch9329_baudrate?: number;
 	ch9329_hybrid_mouse?: boolean;
+	mouse_macos_drag?: boolean;
 	ch9329_descriptor?: Ch9329DescriptorConfigUpdate;
 	otg_udc?: string;
 	otg_descriptor?: OtgDescriptorConfigUpdate;
 	otg_profile?: OtgHidProfile;
-	otg_endpoint_budget?: OtgEndpointBudget;
 	otg_functions?: OtgHidFunctionsUpdate;
 	otg_keyboard_leds?: boolean;
 	mouse_absolute?: boolean;
@@ -547,6 +584,51 @@ export interface HidConfigUpdate {
 export interface MsdConfigUpdate {
 	enabled?: boolean;
 	msd_dir?: string;
+	flash_inquiry_string?: string;
+	cdrom_inquiry_string?: string;
+}
+
+export interface NetworkInterfaceInfo {
+	name: string;
+	interface_type: string;
+	state: string;
+	connection: string;
+	addresses: string[];
+	has_default_route: boolean;
+	bridge_supported: boolean;
+	reason?: string;
+}
+
+export enum OtgRuntimeHealth {
+	Healthy = "healthy",
+	Applying = "applying",
+	Degraded = "degraded",
+}
+
+export interface OtgNetworkStatus {
+	health: OtgRuntimeHealth;
+	error?: string;
+}
+
+export interface OtgConfigResponse {
+	hid: HidConfig;
+	msd: MsdConfig;
+	network: OtgNetworkConfig;
+	status: OtgNetworkStatus;
+}
+
+export interface OtgNetworkConfigUpdate {
+	enabled?: boolean;
+	driver_mode?: OtgNetworkDriverMode;
+	bridge_interface?: string;
+	host_mac?: string;
+	device_mac?: string;
+}
+
+export interface OtgConfigUpdate {
+	hid?: HidConfigUpdate;
+	msd?: MsdConfigUpdate;
+	network?: OtgNetworkConfigUpdate;
 }
 
 export interface RtspConfigResponse {
@@ -578,7 +660,9 @@ export interface RtspStatusResponse {
 
 export interface RustDeskConfigUpdate {
 	enabled?: boolean;
+	mode?: RustDeskMode;
 	codec?: RustDeskCodec;
+	direct_access_port?: number;
 	rendezvous_server?: string;
 	relay_server?: string;
 	relay_key?: string;
@@ -639,7 +723,6 @@ export interface VncConfigResponse {
 	bind: string;
 	port: number;
 	encoding: VncEncoding;
-	jpeg_quality: number;
 	allow_one_client: boolean;
 	has_password: boolean;
 }
@@ -649,7 +732,6 @@ export interface VncConfigUpdate {
 	bind?: string;
 	port?: number;
 	encoding?: VncEncoding;
-	jpeg_quality?: number;
 	allow_one_client?: boolean;
 	password?: string;
 }
@@ -658,6 +740,17 @@ export interface VncStatusResponse {
 	config: VncConfigResponse;
 	service_status: string;
 	connection_count: number;
+}
+
+export interface WatchdogConfigResponse {
+	enabled: boolean;
+	supported: boolean;
+	running: boolean;
+	reason?: string;
+}
+
+export interface WatchdogConfigUpdate {
+	enabled: boolean;
 }
 
 /**

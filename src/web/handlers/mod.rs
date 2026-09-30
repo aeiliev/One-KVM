@@ -40,14 +40,14 @@ use axum::{
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use self::config::apply::ConfigApplyOptions;
 use crate::auth::{Session, SESSION_COOKIE};
 use crate::config::StreamMode;
 use crate::diagnostics::{get_device_info, get_disk_space, DeviceInfo, DiskSpaceInfo};
 use crate::error::{AppError, Result};
 use crate::platform::PlatformCapabilities;
+use crate::runtime::ConfigApplyOptions;
 use crate::state::AppState;
 use crate::update::{UpdateChannel, UpdateOverviewResponse, UpdateStatusResponse, UpgradeRequest};
 use crate::utils::list_serial_ports;

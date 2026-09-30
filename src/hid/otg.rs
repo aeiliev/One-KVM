@@ -80,6 +80,8 @@ pub struct OtgBackend {
     keyboard_leds_enabled: bool,
     keyboard_state: Mutex<KeyboardReport>,
     mouse_buttons: AtomicU8,
+    macos_drag: bool,
+    macos_drag_state: Mutex<super::macos_drag::MacosDrag>,
     led_state: Arc<parking_lot::RwLock<LedState>>,
     screen_resolution: parking_lot::RwLock<Option<(u32, u32)>>,
     udc_name: Arc<parking_lot::RwLock<Option<String>>>,
@@ -94,10 +96,20 @@ pub struct OtgBackend {
 }
 
 const HID_WRITE_TIMEOUT_MS: i32 = 20;
+const OTG_RUNTIME_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 impl OtgBackend {
     /// Gadget must already exist; paths come from `OtgService`.
     pub fn from_handles(paths: HidDevicePaths) -> Result<Self> {
+        Self::with_macos_drag(paths, false)
+    }
+
+    pub fn with_macos_drag(paths: HidDevicePaths, macos_drag: bool) -> Result<Self> {
+        if macos_drag && (paths.mouse_relative.is_none() || paths.mouse_absolute.is_none()) {
+            return Err(AppError::Config(
+                "macOS drag compatibility requires both OTG mouse interfaces".into(),
+            ));
+        }
         let (runtime_notify_tx, _runtime_notify_rx) = watch::channel(());
         Ok(Self {
             keyboard_path: paths.keyboard,
@@ -111,6 +123,8 @@ impl OtgBackend {
             keyboard_leds_enabled: paths.keyboard_leds_enabled,
             keyboard_state: Mutex::new(KeyboardReport::default()),
             mouse_buttons: AtomicU8::new(0),
+            macos_drag,
+            macos_drag_state: Mutex::new(super::macos_drag::MacosDrag::default()),
             led_state: Arc::new(parking_lot::RwLock::new(LedState::default())),
             screen_resolution: parking_lot::RwLock::new(Some((1920, 1080))),
             udc_name: Arc::new(parking_lot::RwLock::new(paths.udc)),
@@ -166,9 +180,9 @@ impl OtgBackend {
         if now.duration_since(*last_log).as_secs() >= 1 {
             let count = self.error_count.swap(0, Ordering::Relaxed);
             if count > 1 {
-                warn!("{} (repeated {} times)", msg, count);
+                debug!("{} (repeated {} times)", msg, count);
             } else {
-                warn!("{}", msg);
+                debug!("{}", msg);
             }
             *last_log = now;
         } else {
@@ -587,7 +601,7 @@ impl OtgBackend {
                         path.display(),
                         err
                     );
-                    thread::sleep(Duration::from_millis(500));
+                    thread::sleep(OTG_RUNTIME_POLL_INTERVAL);
                     return false;
                 }
             }
@@ -611,6 +625,7 @@ impl OtgBackend {
 
                 if revents.contains(PollFlags::POLLERR) || revents.contains(PollFlags::POLLHUP) {
                     *file = None;
+                    thread::sleep(OTG_RUNTIME_POLL_INTERVAL);
                     return true;
                 }
 
@@ -633,8 +648,13 @@ impl OtgBackend {
                     Ok(_) => false,
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => false,
                     Err(err) => {
-                        warn!("OTG keyboard LED listener read failed: {}", err);
+                        if err.raw_os_error() == Some(libc::ESHUTDOWN) {
+                            debug!("OTG keyboard LED listener disconnected: {}", err);
+                        } else {
+                            warn!("OTG keyboard LED listener read failed: {}", err);
+                        }
                         *file = None;
+                        thread::sleep(OTG_RUNTIME_POLL_INTERVAL);
                         true
                     }
                 }
@@ -642,6 +662,7 @@ impl OtgBackend {
             Err(err) => {
                 warn!("OTG keyboard LED listener poll failed: {}", err);
                 *file = None;
+                thread::sleep(OTG_RUNTIME_POLL_INTERVAL);
                 true
             }
         }
@@ -676,7 +697,7 @@ impl OtgBackend {
                         changed = true;
                     }
 
-                    if keyboard_leds_enabled {
+                    if keyboard_leds_enabled && current_udc_configured {
                         if let Some(path) = keyboard_path.as_ref() {
                             changed |= Self::poll_keyboard_led_once(
                                 &mut keyboard_led_file,
@@ -684,10 +705,11 @@ impl OtgBackend {
                                 &led_state,
                             );
                         } else {
-                            thread::sleep(Duration::from_millis(500));
+                            thread::sleep(OTG_RUNTIME_POLL_INTERVAL);
                         }
                     } else {
-                        thread::sleep(Duration::from_millis(500));
+                        keyboard_led_file = None;
+                        thread::sleep(OTG_RUNTIME_POLL_INTERVAL);
                     }
 
                     if changed {
@@ -843,6 +865,28 @@ impl HidBackend for OtgBackend {
     async fn send_mouse(&self, event: MouseEvent) -> Result<()> {
         let buttons = self.mouse_buttons.load(Ordering::Relaxed);
 
+        if self.macos_drag {
+            use super::macos_drag::MouseReport;
+            let mut state = self.macos_drag_state.lock();
+            let extent = self.screen_resolution.read().unwrap_or((1920, 1080));
+            let (buttons, reports) = state.plan(event, buttons, extent);
+            self.mouse_buttons.store(buttons, Ordering::Relaxed);
+            for report in reports {
+                match report {
+                    MouseReport::Absolute { buttons, x, y } => {
+                        self.send_mouse_report_absolute(buttons, x, y, 0)?
+                    }
+                    MouseReport::Relative {
+                        buttons,
+                        dx,
+                        dy,
+                        wheel,
+                    } => self.send_mouse_report_relative(buttons, dx, dy, wheel)?,
+                }
+            }
+            return Ok(());
+        }
+
         match event.event_type {
             MouseEventType::Move => {
                 let dx = event.x.clamp(-127, 127) as i8;
@@ -887,10 +931,24 @@ impl HidBackend for OtgBackend {
         }
 
         self.mouse_buttons.store(0, Ordering::Relaxed);
+        self.macos_drag_state.lock().reset();
         self.send_mouse_report_relative(0, 0, 0, 0)?;
         self.send_mouse_report_absolute(0, 0, 0, 0)?;
 
         info!("HID state reset");
+        Ok(())
+    }
+
+    async fn prepare_rebuild(&self) -> Result<()> {
+        self.stop_runtime_worker();
+        *self.keyboard_dev.lock() = None;
+        *self.mouse_rel_dev.lock() = None;
+        *self.mouse_abs_dev.lock() = None;
+        *self.consumer_dev.lock() = None;
+        self.initialized.store(false, Ordering::Relaxed);
+        self.online.store(false, Ordering::Relaxed);
+        self.notify_runtime_changed();
+        info!("OTG backend prepared for gadget rebuild");
         Ok(())
     }
 
@@ -948,6 +1006,7 @@ impl Drop for OtgBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom, Write};
 
     #[test]
     fn test_led_state() {
@@ -963,5 +1022,68 @@ mod tests {
     fn test_report_sizes() {
         let kb_report = KeyboardReport::default();
         assert_eq!(kb_report.to_bytes().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn mouse_compatibility_writes_both_endpoints_and_preserves_default() {
+        use crate::hid::MouseButton;
+        for enabled in [false, true] {
+            let relative = tempfile::NamedTempFile::new().unwrap();
+            let absolute = tempfile::NamedTempFile::new().unwrap();
+            let backend = OtgBackend::with_macos_drag(
+                HidDevicePaths {
+                    mouse_relative: Some(relative.path().to_path_buf()),
+                    mouse_absolute: Some(absolute.path().to_path_buf()),
+                    ..Default::default()
+                },
+                enabled,
+            )
+            .unwrap();
+            for event in [
+                MouseEvent::move_abs(8000, 8000),
+                MouseEvent::button_down(MouseButton::Left),
+                MouseEvent::move_abs(16000, 16000),
+                MouseEvent::button_up(MouseButton::Left),
+            ] {
+                backend.send_mouse(event).await.unwrap();
+            }
+            let abs = fs::read(absolute.path()).unwrap();
+            let rel = fs::read(relative.path()).unwrap();
+            let buttons: Vec<_> = abs.chunks_exact(6).map(|packet| packet[0]).collect();
+            assert_eq!(buttons, if enabled { vec![0, 1, 0] } else { vec![0, 0] });
+            let dx: i32 = rel
+                .chunks_exact(4)
+                .map(|packet| i32::from(packet[1] as i8))
+                .sum();
+            let dy: i32 = rel
+                .chunks_exact(4)
+                .map(|packet| i32::from(packet[2] as i8))
+                .sum();
+            assert_eq!((dx, dy), if enabled { (468, 263) } else { (0, 0) });
+            assert_eq!(&rel[rel.len() - 4..], &[0, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn compatibility_requires_both_mouse_endpoints() {
+        assert!(OtgBackend::with_macos_drag(HidDevicePaths::default(), true).is_err());
+    }
+
+    #[tokio::test]
+    async fn prepare_rebuild_closes_devices_without_writing_reset_reports() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"sentinel").unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+
+        let backend = OtgBackend::from_handles(HidDevicePaths::default()).unwrap();
+        *backend.keyboard_dev.lock() = Some(file);
+        backend.initialized.store(true, Ordering::Relaxed);
+        backend.online.store(true, Ordering::Relaxed);
+
+        backend.prepare_rebuild().await.unwrap();
+
+        assert!(backend.keyboard_dev.lock().is_none());
+        assert!(!backend.initialized.load(Ordering::Relaxed));
+        assert!(!backend.online.load(Ordering::Relaxed));
     }
 }

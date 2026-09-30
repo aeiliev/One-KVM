@@ -3,6 +3,7 @@ use tracing::debug;
 
 use super::configfs::{
     create_dir, create_symlink, remove_dir, remove_file, write_bytes, write_file,
+    write_file_if_exists,
 };
 use super::function::GadgetFunction;
 use super::report_desc::{
@@ -19,15 +20,6 @@ pub enum HidFunctionType {
 }
 
 impl HidFunctionType {
-    pub fn endpoints(&self) -> u8 {
-        match self {
-            HidFunctionType::Keyboard => 1,
-            HidFunctionType::MouseRelative => 1,
-            HidFunctionType::MouseAbsolute => 1,
-            HidFunctionType::ConsumerControl => 1,
-        }
-    }
-
     pub fn protocol(&self) -> u8 {
         match self {
             HidFunctionType::Keyboard => 1,
@@ -130,10 +122,6 @@ impl GadgetFunction for HidFunction {
         &self.name
     }
 
-    fn endpoints_required(&self) -> u8 {
-        self.func_type.endpoints()
-    }
-
     fn create(&self, gadget_path: &Path) -> Result<()> {
         let func_path = self.function_path(gadget_path);
         create_dir(&func_path)?;
@@ -155,6 +143,10 @@ impl GadgetFunction for HidFunction {
             &func_path.join("report_desc"),
             self.func_type.report_desc(self.keyboard_leds),
         )?;
+
+        // Supported by the PiKVM HID kernel patch. Older kernels simply do
+        // not expose this ConfigFS attribute.
+        let _ = write_file_if_exists(&func_path.join("wakeup_on_write"), "1")?;
 
         debug!(
             "Created HID function: {} at {}",
@@ -197,10 +189,6 @@ mod tests {
 
     #[test]
     fn test_hid_function_types() {
-        assert_eq!(HidFunctionType::Keyboard.endpoints(), 1);
-        assert_eq!(HidFunctionType::MouseRelative.endpoints(), 1);
-        assert_eq!(HidFunctionType::MouseAbsolute.endpoints(), 1);
-
         assert_eq!(HidFunctionType::Keyboard.report_length(false), 8);
         assert_eq!(HidFunctionType::Keyboard.report_length(true), 8);
         assert_eq!(HidFunctionType::MouseRelative.report_length(false), 4);
