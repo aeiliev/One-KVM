@@ -1,22 +1,52 @@
 name: Docker
 
+# Builds and publishes One-KVM container images.
+#
+# Images are published to the GitHub Container Registry of whichever account
+# owns this repository, using the automatically provided GITHUB_TOKEN, so no
+# repository secrets are needed:
+#
+#     ghcr.io/<owner>/one-kvm        minimal: One-KVM + ttyd
+#     ghcr.io/<owner>/one-kvm-full   adds gostc + easytier-core
+#
+# Docker Hub is published as well, but only when both the DOCKERHUB_USERNAME
+# and DOCKERHUB_TOKEN repository secrets are configured.
+#
+# The runner is an amd64 machine: `cross` cross-compiles the target binary
+# (see Cross.toml) and QEMU builds the foreign-architecture runtime image.
+# The default target is linux/arm64. Pass platforms=linux/amd64,linux/arm64
+# (optionally adding linux/arm/v7) to publish a multi-arch manifest instead;
+# every extra platform rebuilds FFmpeg, x264/x265, libvpx and friends inside
+# its own cross image, so the job takes roughly twice as long per platform.
+
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Docker image tag
+        description: Image tag to publish
         required: false
         default: latest
       platforms:
-        description: Docker platforms
+        description: Target platforms, comma separated
         required: false
-        default: linux/amd64,linux/arm64,linux/arm/v7
+        default: linux/arm64
+      variants:
+        description: Image variants to publish
+        required: false
+        default: minimal,full
+        type: choice
+        options:
+          - minimal,full
+          - minimal
+          - full
   push:
     tags:
       - "v*"
 
 permissions:
   contents: read
+  # Required to push to ghcr.io with the built-in GITHUB_TOKEN.
+  packages: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -24,8 +54,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  DOCKER_PLATFORMS: ${{ github.event_name == 'workflow_dispatch' && inputs.platforms || 'linux/amd64,linux/arm64,linux/arm/v7' }}
   DOCKER_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  DOCKER_PLATFORMS: ${{ github.event_name == 'workflow_dispatch' && inputs.platforms || 'linux/arm64' }}
+  DOCKER_VARIANTS: ${{ github.event_name == 'workflow_dispatch' && inputs.variants || 'minimal,full' }}
+  # Empty when the optional Docker Hub secrets are not configured.
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
 jobs:
   docker:
@@ -67,25 +101,61 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build linux binaries
-        run: bash build/build-images.sh
+        run: |
+          set -euo pipefail
+          archs=""
+          IFS=',' read -ra platforms <<< "$DOCKER_PLATFORMS"
+          for platform in "${platforms[@]}"; do
+            case "$platform" in
+              linux/amd64)  archs="$archs x86_64" ;;
+              linux/arm64)  archs="$archs arm64" ;;
+              linux/arm/v7) archs="$archs armv7" ;;
+              *) echo "unsupported platform: $platform" >&2; exit 1 ;;
+            esac
+          done
+          for arch in $archs; do
+            echo "::group::cross build $arch"
+            bash build/build-images.sh "$arch"
+            echo "::endgroup::"
+          done
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to GitHub Container Registry
+        run: |
+          set -euo pipefail
+          # ghcr.io requires a lowercase namespace.
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          for variant in ${DOCKER_VARIANTS//,/ }; do
+            ./build/package-docker.sh \
+              --platform "$DOCKER_PLATFORMS" \
+              --registry "ghcr.io/$owner" \
+              --variant "$variant" \
+              --tag "$DOCKER_TAG" \
+              --push
+          done
 
       - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
         uses: docker/login-action@v3
         with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
 
-      - name: Log in to Aliyun Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: registry.cn-hangzhou.aliyuncs.com
-          username: ${{ secrets.ALIYUN_USERNAME }}
-          password: ${{ secrets.ALIYUN_PASSWORD }}
-
-      - name: Publish Docker images
+      - name: Publish to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
         run: |
-          ./build/package-docker.sh --platform "$DOCKER_PLATFORMS" --registry docker.io/silentwind0 --tag "$DOCKER_TAG" --push
-          ./build/package-docker.sh --platform "$DOCKER_PLATFORMS" --registry registry.cn-hangzhou.aliyuncs.com/silentwind --tag "$DOCKER_TAG" --push
-          ./build/package-docker.sh --platform "$DOCKER_PLATFORMS" --registry docker.io/silentwind0 --variant full --tag "$DOCKER_TAG" --push
-          ./build/package-docker.sh --platform "$DOCKER_PLATFORMS" --registry registry.cn-hangzhou.aliyuncs.com/silentwind --variant full --tag "$DOCKER_TAG" --push
+          set -euo pipefail
+          for variant in ${DOCKER_VARIANTS//,/ }; do
+            ./build/package-docker.sh \
+              --platform "$DOCKER_PLATFORMS" \
+              --registry "docker.io/$DOCKERHUB_USERNAME" \
+              --variant "$variant" \
+              --tag "$DOCKER_TAG" \
+              --push
+          done
