@@ -39,6 +39,7 @@ Goals: an open, lightweight, easy-to-use IP-KVM stack.
 | Video capture | HDMI USB / MIPI CSI / RK3588 HDMI IN; MJPEG and WebRTC (H.264 / H.265 / VP8 / VP9) |
 | Video encoding | VAAPI / QSV / RKMPP / V4L2 M2M hardware paths, with software fallback |
 | Keyboard & mouse | USB OTG HID or CH340 + CH9329 HID; absolute / relative mouse |
+| Mouse jiggler | Nudges the mouse once the target host has been idle for the configured interval, to stop sleep or the screensaver; toggle and interval are in the web UI |
 | Virtual media | USB mass storage; ISO/IMG mount and Ventoy-style virtual USB |
 | ATX power | GPIO or USB relay; power and reset control |
 | Audio | ALSA capture + Opus (HTTP / WebRTC) |

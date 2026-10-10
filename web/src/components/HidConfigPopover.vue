@@ -210,6 +210,31 @@ async function applyHidConfig() {
   }
 }
 
+const jigglerSaving = ref(false)
+const jigglerEnabled = computed(() => configStore.hid?.jiggler?.enabled ?? false)
+const jigglerInterval = computed(() => configStore.hid?.jiggler?.interval_secs ?? 60)
+
+async function updateJiggler(enabled: boolean) {
+  if (configStore.hidLoading || jigglerSaving.value) return
+  if ((configStore.hid?.jiggler?.enabled ?? false) === enabled) return
+
+  jigglerSaving.value = true
+  try {
+    // The interval is owned by the settings page, so carry it over: the backend
+    // replaces the whole jiggler object rather than merging fields.
+    await configStore.updateHid({
+      jiggler: { enabled, interval_secs: jigglerInterval.value },
+    })
+  } catch (error) {
+    toast.error(t('config.updateFailed'), {
+      description: error instanceof Error ? error.message : undefined,
+    })
+    await configStore.refreshHid().catch(() => undefined)
+  } finally {
+    jigglerSaving.value = false
+  }
+}
+
 watch(() => props.open, (isOpen) => {
   if (!isOpen) return
 
@@ -303,6 +328,27 @@ watch(() => props.open, (isOpen) => {
             <Label class="text-xs text-muted-foreground">{{ t('actionbar.showCursor') }}</Label>
             <Switch v-model="showCursor" />
           </div>
+        </div>
+
+        <Separator />
+
+        <!-- Mouse Jiggler (quick toggle; the interval lives in Settings) -->
+        <div class="space-y-2" :aria-busy="jigglerSaving">
+          <div class="flex items-center justify-between gap-3">
+            <div class="flex items-center gap-1">
+              <Label for="hid-jiggler" class="text-xs">{{ t('actionbar.jiggler') }}</Label>
+              <HelpTooltip :content="t('settings.jigglerDesc')" icon-size="sm" />
+            </div>
+            <Switch
+              id="hid-jiggler"
+              :model-value="jigglerEnabled"
+              :disabled="configStore.hidLoading || jigglerSaving"
+              @update:model-value="updateJiggler"
+            />
+          </div>
+          <p class="text-xs text-muted-foreground">
+            {{ t('actionbar.jigglerEvery', { seconds: jigglerInterval }) }}
+          </p>
         </div>
 
         <!-- HID Device Settings (Requires Apply) -->

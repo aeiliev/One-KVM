@@ -583,6 +583,12 @@ async fn main() -> anyhow::Result<()> {
         data_dir.clone(),
     );
 
+    let hid_config = state.config.get().hid.clone();
+    state
+        .jiggler
+        .apply_config(&hid_config.jiggler, hid_config.mouse_absolute)
+        .await;
+
     extensions.set_event_bus(events.clone()).await;
 
     if let Some(ref service) = rustdesk {
@@ -1195,6 +1201,10 @@ async fn cleanup(state: &Arc<AppState>) {
     if let Err(e) = state.stream_manager.stop().await {
         tracing::warn!("Failed to stop streamer: {}", e);
     }
+
+    // Stop the jiggler before the HID backend goes away, so it cannot wake up
+    // mid-shutdown and log a failure against a torn-down backend.
+    state.jiggler.stop().await;
 
     if let Err(e) = state.hid.shutdown().await {
         tracing::warn!("Failed to shutdown HID: {}", e);

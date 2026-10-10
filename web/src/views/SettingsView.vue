@@ -585,6 +585,8 @@ const config = ref({
   } as OtgHidFunctions,
   hid_otg_keyboard_leds: false,
   hid_ch9329_hybrid_mouse: false,
+  hid_jiggler_enabled: false,
+  hid_jiggler_interval: 60,
   msd_enabled: false,
   msd_dir: '',
   encoder_backend: 'auto',
@@ -1100,10 +1102,20 @@ const isCh9329DescriptorDirty = computed(() => {
     || current.serialNumber !== baseline.serialNumber
 })
 
+const JIGGLER_MIN_INTERVAL_SECS = 5
+const JIGGLER_MAX_INTERVAL_SECS = 3600
+const isJigglerIntervalValid = computed(() => {
+  const seconds = Number(config.value.hid_jiggler_interval)
+  return Number.isFinite(seconds)
+    && seconds >= JIGGLER_MIN_INTERVAL_SECS
+    && seconds <= JIGGLER_MAX_INTERVAL_SECS
+})
+
 const isHidSettingsValid = computed(() =>
   isHidFunctionSelectionValid.value
   && isOtgEndpointBudgetValid.value
   && isCh9329DescriptorValid.value
+  && isJigglerIntervalValid.value
 )
 
 watch(() => config.value.msd_enabled, (enabled) => {
@@ -1420,6 +1432,10 @@ async function saveConfig() {
         ch9329_port: config.value.hid_serial_device || undefined,
         ch9329_baudrate: config.value.hid_serial_baudrate,
         ch9329_hybrid_mouse: config.value.hid_ch9329_hybrid_mouse,
+        jiggler: {
+          enabled: config.value.hid_jiggler_enabled,
+          interval_secs: config.value.hid_jiggler_interval,
+        },
       }
       if (config.value.hid_backend === 'ch9329' && isCh9329DescriptorDirty.value) {
         hidUpdate.ch9329_descriptor = {
@@ -1497,6 +1513,8 @@ async function loadConfig() {
       } as OtgHidFunctions,
       hid_otg_keyboard_leds: hid.otg_keyboard_leds ?? false,
       hid_ch9329_hybrid_mouse: hid.ch9329_hybrid_mouse ?? false,
+      hid_jiggler_enabled: hid.jiggler?.enabled ?? false,
+      hid_jiggler_interval: hid.jiggler?.interval_secs ?? 60,
       msd_enabled: msd.enabled || false,
       msd_dir: msd.msd_dir || '',
       encoder_backend: stream.encoder || 'auto',
@@ -3298,6 +3316,37 @@ watch(isWindows, () => {
                     </p>
                   </div>
                 </template>
+              </CardContent>
+            </Card>
+
+            <!-- Mouse Jiggler -->
+            <Card v-if="config.hid_backend !== 'none'">
+              <CardHeader>
+                <CardTitle>{{ t('settings.jiggler') }}</CardTitle>
+              </CardHeader>
+              <CardContent class="space-y-4">
+                <div class="flex items-center justify-between gap-4">
+                  <div class="space-y-1">
+                    <Label for="hid-jiggler-enabled">{{ t('settings.jigglerEnabled') }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t('settings.jigglerDesc') }}</p>
+                  </div>
+                  <Switch id="hid-jiggler-enabled" v-model="config.hid_jiggler_enabled" />
+                </div>
+                <Separator />
+                <div class="space-y-2">
+                  <Label for="hid-jiggler-interval">{{ t('settings.jigglerInterval') }}</Label>
+                  <Input
+                    id="hid-jiggler-interval"
+                    type="number"
+                    :min="JIGGLER_MIN_INTERVAL_SECS"
+                    :max="JIGGLER_MAX_INTERVAL_SECS"
+                    :disabled="!config.hid_jiggler_enabled"
+                    v-model.number="config.hid_jiggler_interval"
+                  />
+                  <p class="text-xs" :class="isJigglerIntervalValid ? 'text-muted-foreground' : 'text-amber-600 dark:text-amber-400'">
+                    {{ t('settings.jigglerIntervalHint', { min: JIGGLER_MIN_INTERVAL_SECS, max: JIGGLER_MAX_INTERVAL_SECS }) }}
+                  </p>
+                </div>
               </CardContent>
             </Card>
 

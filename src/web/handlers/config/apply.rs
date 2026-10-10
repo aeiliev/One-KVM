@@ -169,6 +169,14 @@ pub async fn apply_hid_config(
     new_config: &HidConfig,
     options: ConfigApplyOptions,
 ) -> Result<()> {
+    // The jiggler is not part of the USB gadget, so it is applied up front: the
+    // paths below skip reloads when the backend is unchanged, and a
+    // jiggler-only change must still take effect.
+    state
+        .jiggler
+        .apply_config(&new_config.jiggler, new_config.mouse_absolute)
+        .await;
+
     let current_config = state.config.get();
     let current_msd_enabled = current_config.msd.enabled && new_config.backend == HidBackend::Otg;
     new_config.validate_otg_endpoint_budget(current_msd_enabled)?;

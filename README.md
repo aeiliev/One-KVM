@@ -39,6 +39,7 @@
 | 视频采集 | HDMI USB /MIPI CSI/RK3588 HDMI IN 采集支持，提供 MJPEG / WebRTC（H.264/H.265/VP8/VP9） 视频流|
 | 视频编码 | VAAPI/QSV/RKMPP/V4L2M2M 硬件编码支持，以及软件编码兜底 |
 | 键鼠控制 | USB OTG HID 或 CH340 + CH9329 HID，支持绝对/相对鼠标模式 |
+| 鼠标防休眠 | 受控主机空闲超过设定间隔后自动轻微移动鼠标，避免锁屏或休眠，可在网页界面开关并设置间隔 |
 | 虚拟媒体 | USB Mass Storage，支持 ISO/IMG 镜像挂载和 Ventoy 虚拟U盘模式 |
 | ATX 电源控制 | GPIO /USB 继电器，支持控制电源、重启按钮 |
 | 音频传输 | ALSA 采集 + Opus 编码（HTTP/WebRTC） |
