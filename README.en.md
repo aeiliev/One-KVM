@@ -4,10 +4,10 @@
 
   <p><a href="README.md">简体中文</a> · <a href="README.en.md">English</a></p>
 
-  [![GitHub Release](https://img.shields.io/github/v/release/mofeng-git/One-KVM)](https://github.com/mofeng-git/One-KVM/releases)
-  [![GitHub stars](https://img.shields.io/github/stars/mofeng-git/One-KVM?style=social)](https://github.com/mofeng-git/One-KVM/stargazers)
-  [![GitHub forks](https://img.shields.io/github/forks/mofeng-git/One-KVM?style=social)](https://github.com/mofeng-git/One-KVM/network/members)
-  [![GitHub issues](https://img.shields.io/github/issues/mofeng-git/One-KVM)](https://github.com/mofeng-git/One-KVM/issues)
+  [![GitHub Release](https://img.shields.io/github/v/release/aeiliev/One-KVM)](https://github.com/aeiliev/One-KVM/releases)
+  [![GitHub stars](https://img.shields.io/github/stars/aeiliev/One-KVM?style=social)](https://github.com/aeiliev/One-KVM/stargazers)
+  [![GitHub forks](https://img.shields.io/github/forks/aeiliev/One-KVM?style=social)](https://github.com/aeiliev/One-KVM/network/members)
+  [![GitHub issues](https://img.shields.io/github/issues/aeiliev/One-KVM)](https://github.com/aeiliev/One-KVM/issues)
 </div>
 
 ---
@@ -47,7 +47,7 @@ The web UI supports visual configuration and Chinese/English locales. Built-ins 
 
 ## Installation
 
-Release artifacts are on [GitHub Releases](https://github.com/mofeng-git/One-KVM/releases). Below are short paths for common setups. For **system requirements, hardware, Docker env vars, USB OTG**, and full troubleshooting, see the [One-KVM documentation](https://docs.one-kvm.cn/) (Chinese; use a translator if needed).
+Release artifacts are on [GitHub Releases](https://github.com/aeiliev/One-KVM/releases). Below are short paths for common setups. For **system requirements, hardware, Docker env vars, USB OTG**, and full troubleshooting, see the [One-KVM documentation](https://docs.one-kvm.cn/) (Chinese; use a translator if needed).
 
 ### Debian / Ubuntu (.deb)
 
@@ -74,10 +74,10 @@ docker run --name one-kvm -itd \
   --privileged=true --restart unless-stopped \
   -v /dev:/dev -v /sys:/sys \
   --net=host \
-  silentwind0/one-kvm-full
+  ghcr.io/aeiliev/one-kvm-full
 ```
 
-If pulls are slow, use the Aliyun mirror, e.g. `registry.cn-hangzhou.aliyuncs.com/silentwind/one-kvm-full` (and `registry.cn-hangzhou.aliyuncs.com/silentwind/one-kvm` for the slim image).
+Images are published to the GitHub Container Registry as `ghcr.io/aeiliev/one-kvm-full` and `ghcr.io/aeiliev/one-kvm` (also published as `<DockerHub user>/one-kvm-full` and `<DockerHub user>/one-kvm` when Docker Hub credentials are configured).
 
 ### fnOS NAS (Feiniu / 飞牛)
 
@@ -91,7 +91,7 @@ Open `http://<device-ip>:8080` in a browser (**8420** after fnOS install). The f
 
 If something breaks:
 
-1. Open [GitHub Issues](https://github.com/mofeng-git/One-KVM/issues) or report in the project QQ group.  
+1. Open [GitHub Issues](https://github.com/aeiliev/One-KVM/issues) or report in the project QQ group.  
 2. Include **useful** error messages and steps to reproduce.  
 3. Mention software version, hardware, and OS details.
 

@@ -4,10 +4,10 @@
 
   <p><a href="README.md">简体中文</a> · <a href="README.en.md">English</a></p>
 
-  [![GitHub Release](https://img.shields.io/github/v/release/mofeng-git/One-KVM)](https://github.com/mofeng-git/One-KVM/releases)
-  [![GitHub stars](https://img.shields.io/github/stars/mofeng-git/One-KVM?style=social)](https://github.com/mofeng-git/One-KVM/stargazers)
-  [![GitHub forks](https://img.shields.io/github/forks/mofeng-git/One-KVM?style=social)](https://github.com/mofeng-git/One-KVM/network/members)
-  [![GitHub issues](https://img.shields.io/github/issues/mofeng-git/One-KVM)](https://github.com/mofeng-git/One-KVM/issues)
+  [![GitHub Release](https://img.shields.io/github/v/release/aeiliev/One-KVM)](https://github.com/aeiliev/One-KVM/releases)
+  [![GitHub stars](https://img.shields.io/github/stars/aeiliev/One-KVM?style=social)](https://github.com/aeiliev/One-KVM/stargazers)
+  [![GitHub forks](https://img.shields.io/github/forks/aeiliev/One-KVM?style=social)](https://github.com/aeiliev/One-KVM/network/members)
+  [![GitHub issues](https://img.shields.io/github/issues/aeiliev/One-KVM)](https://github.com/aeiliev/One-KVM/issues)
 </div>
 
 ---
@@ -47,7 +47,7 @@
 
 ## ⚡ 安装使用
 
-构建产物见 [GitHub Releases](https://github.com/mofeng-git/One-KVM/releases)。以下为常见安装方式的简要步骤；**系统要求、硬件准备、Docker 环境变量与 USB OTG 等完整说明**请查阅 [One-KVM Rust 文档站点](https://docs.one-kvm.cn/)。
+构建产物见 [GitHub Releases](https://github.com/aeiliev/One-KVM/releases)。以下为常见安装方式的简要步骤；**系统要求、硬件准备、Docker 环境变量与 USB OTG 等完整说明**请查阅 [One-KVM Rust 文档站点](https://docs.one-kvm.cn/)。
 
 ### 使用 deb 安装（Debian / Ubuntu）
 
@@ -69,10 +69,10 @@ docker run --name one-kvm -itd \
   --privileged=true --restart unless-stopped \
   -v /dev:/dev -v /sys:/sys \
   --net=host \
-  silentwind0/one-kvm-full
+  ghcr.io/aeiliev/one-kvm-full
 ```
 
-拉取较慢时，可将镜像名替换为阿里云加速，例如 `registry.cn-hangzhou.aliyuncs.com/silentwind/one-kvm-full`（`one-kvm` 镜像同理，将 `silentwind0/one-kvm` 换为 `registry.cn-hangzhou.aliyuncs.com/silentwind/one-kvm`）。
+镜像发布在 GitHub Container Registry：`ghcr.io/aeiliev/one-kvm-full` 与 `ghcr.io/aeiliev/one-kvm`（若配置了 Docker Hub 凭据，也会同步发布为 `<DockerHub 用户名>/one-kvm-full` 和 `<DockerHub 用户名>/one-kvm`）。
 
 ### 飞牛 NAS
 
@@ -85,7 +85,7 @@ One-KVM 已上架飞牛 **应用市场**，在 NAS 上直接搜索安装即可�
 ## 报告问题
 
 如果您发现了问题，请：
-1. 使用 [GitHub Issues](https://github.com/mofeng-git/One-KVM/issues) 报告，或加入 QQ 群聊反馈。
+1. 使用 [GitHub Issues](https://github.com/aeiliev/One-KVM/issues) 报告，或加入 QQ 群聊反馈。
 2. 提供有帮助的错误信息和复现步骤
 3. 包含您使用的软件版本、硬件配置和系统信息
 
