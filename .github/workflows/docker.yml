@@ -17,6 +17,8 @@ on:
 
 permissions:
   contents: read
+  # Required to push to ghcr.io with the built-in GITHUB_TOKEN.
+  packages: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -26,6 +28,9 @@ env:
   CARGO_TERM_COLOR: always
   DOCKER_PLATFORMS: ${{ github.event_name == 'workflow_dispatch' && inputs.platforms || 'linux/amd64,linux/arm64,linux/arm/v7' }}
   DOCKER_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  # Empty when the optional Docker Hub secrets are not configured.
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
 jobs:
   docker:
@@ -63,23 +68,30 @@ jobs:
       - name: Build linux binaries
         run: bash build/build-images.sh
 
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to GitHub Container Registry
+        run: |
+          # ghcr.io requires a lowercase namespace.
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          ./build/package-docker.sh --platform "$DOCKER_PLATFORMS" --registry "ghcr.io/$owner" --tag "$DOCKER_TAG" --push
+          ./build/package-docker.sh --platform "$DOCKER_PLATFORMS" --registry "ghcr.io/$owner" --variant full --tag "$DOCKER_TAG" --push
+
       - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
         uses: docker/login-action@v3
         with:
           registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
 
-      - name: Log in to Aliyun Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: registry.cn-hangzhou.aliyuncs.com
-          username: ${{ secrets.ALIYUN_USERNAME }}
-          password: ${{ secrets.ALIYUN_PASSWORD }}
-
-      - name: Publish Docker images
+      - name: Publish to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
         run: |
-          ./build/package-docker.sh --platform "$DOCKER_PLATFORMS" --registry docker.io/silentwind0 --tag "$DOCKER_TAG" --push
-          ./build/package-docker.sh --platform "$DOCKER_PLATFORMS" --registry registry.cn-hangzhou.aliyuncs.com/silentwind --tag "$DOCKER_TAG" --push
-          ./build/package-docker.sh --platform "$DOCKER_PLATFORMS" --registry docker.io/silentwind0 --variant full --tag "$DOCKER_TAG" --push
-          ./build/package-docker.sh --platform "$DOCKER_PLATFORMS" --registry registry.cn-hangzhou.aliyuncs.com/silentwind --variant full --tag "$DOCKER_TAG" --push
+          ./build/package-docker.sh --platform "$DOCKER_PLATFORMS" --registry "docker.io/$DOCKERHUB_USERNAME" --tag "$DOCKER_TAG" --push
+          ./build/package-docker.sh --platform "$DOCKER_PLATFORMS" --registry "docker.io/$DOCKERHUB_USERNAME" --variant full --tag "$DOCKER_TAG" --push
