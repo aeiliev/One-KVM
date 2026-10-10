@@ -12,7 +12,16 @@ ARG TARGETPLATFORM
 # Install runtime dependencies in a single layer
 # All codec libraries (libx264, libx265, libopus) are now statically linked
 # Only hardware acceleration drivers and core system libraries remain dynamic
-RUN sed -i 's/ main$/ main contrib non-free/' /etc/apt/sources.list && \
+# Debian 11 (bullseye) is end-of-life: deb.debian.org still serves the `main`
+# suite but has removed the `bullseye-security` pool, so apt installs now fail
+# with 404s (ca-certificates, systemd, ...). Use the official Debian archive,
+# which holds the complete final bullseye state; contrib and non-free are
+# already enabled below, so no extra sed is needed.
+RUN printf '%s\n' \
+        "deb [check-valid-until=no] http://archive.debian.org/debian bullseye main contrib non-free" \
+        "deb [check-valid-until=no] http://archive.debian.org/debian-security bullseye-security main contrib non-free" \
+        "deb [check-valid-until=no] http://archive.debian.org/debian bullseye-updates main" \
+        > /etc/apt/sources.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         # Core runtime (all platforms) - no codec libs needed
