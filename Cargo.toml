@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["SilentWind"]
 description = "A open and lightweight IP-KVM solution written in Rust"
 license = "AGPL-3.0-only"
-repository = "https://github.com/mofeng-git/One-KVM"
+repository = "https://github.com/aeiliev/One-KVM"
 keywords = ["kvm", "ipkvm", "remote-management", "embedded"]
 categories = ["embedded", "network-programming"]
 
