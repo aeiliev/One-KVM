@@ -49,8 +49,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           # Reuse dependency artifacts produced by the deb job and vice versa.
-          shared-key: linux-cross-release
-          key: ${{ hashFiles('Cross.toml', 'build/cross/Dockerfile.*') }}
+          # The Cross image is part of the key, because rust-cache ignores `key`
+          # when `shared-key` is set and `target/` holds host build scripts whose
+          # glibc cargo does not fingerprint: artifacts built in a newer image
+          # (e.g. Debian 12 on `main`) cannot run in an older one (Debian 11).
+          shared-key: linux-cross-release-${{ hashFiles('Cross.toml', 'build/cross/Dockerfile.*') }}
           cache-all-crates: true
 
       - name: Install build dependencies
