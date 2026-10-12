@@ -257,7 +257,12 @@ fn run(
 
         let capture = active.as_mut().expect("opened capture");
         let reservations = pipeline.reserve_outputs();
-        let result = if reservations.as_ref().is_none_or(Vec::is_empty) {
+        // Only skip capture when nobody is subscribed.  A full one-slot
+        // subscriber channel must not throw away a captured frame: this probe
+        // runs microseconds after the previous send, so the slot is still
+        // occupied and every other captured frame would be discarded
+        // (60 fps source -> 30 fps output).
+        let result = if pipeline.subscriber_count() == 0 {
             match capture.encoder.as_mut().expect("active encoder") {
                 CaptureEncoder::Dma(_) => capture
                     .stream
