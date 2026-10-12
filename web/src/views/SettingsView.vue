@@ -1763,6 +1763,12 @@ function getExtStatusClass(status: ExtensionStatus | undefined): string {
   }
 }
 
+// Kept out of the template on purpose: vue-tsc's template codegen flattens a
+// component's props into one line and rewrites every `//` it finds into a block
+// comment, so a literal `tcp://...` attribute value corrupts the generated code
+// (it surfaces as bogus "Cannot find name 'i'" errors in the v-for below).
+const easytierPeerPlaceholder = 'tcp://1.2.3.4:11010'
+
 function addEasytierPeer() {
   if (!extConfig.value.easytier.peer_urls) {
     extConfig.value.easytier.peer_urls = []
@@ -4555,7 +4561,7 @@ watch(isWindows, () => {
                           <Label class="sm:text-right">{{ t('extensions.easytier.peers') }}</Label>
                           <div class="sm:col-span-3 space-y-2">
                             <div v-for="(_, i) in extConfig.easytier.peer_urls" :key="i" class="flex gap-2">
-                              <Input v-model="extConfig.easytier.peer_urls[i]" placeholder="tcp://1.2.3.4:11010" :disabled="isExtRunning(extensions?.easytier?.status)" />
+                              <Input v-model="extConfig.easytier.peer_urls[i]" :placeholder="easytierPeerPlaceholder" :disabled="isExtRunning(extensions?.easytier?.status)" />
                               <Button variant="ghost" size="icon" :aria-label="t('common.delete')" @click="removeEasytierPeer(i)" :disabled="isExtRunning(extensions?.easytier?.status)">
                                 <Trash2 class="size-4" />
                               </Button>
