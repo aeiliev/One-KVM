@@ -154,6 +154,14 @@ fn run(
     let mut fps_frames = 0u32;
     let mut fps_start = Instant::now();
     let errors = LogThrottler::with_secs(5);
+    // Opt-in diagnostics: ONE_KVM_VIDEO_STATS=1.  delivered_fps is the number
+    // that matters to a client; encoded_fps is what the encoder produced.
+    let perf_logging = std::env::var("ONE_KVM_VIDEO_STATS").as_deref() == Ok("1");
+    let mut perf_start = Instant::now();
+    let mut perf_loops = 0u64;
+    let mut perf_encoded = 0u64;
+    let mut perf_delivered = 0u64;
+    let mut perf_probe_miss = 0u64;
 
     while pipeline.running_flag.load(Ordering::Acquire) {
         if pipeline.subscriber_count() == 0 {
@@ -256,12 +264,12 @@ fn run(
         }
 
         let capture = active.as_mut().expect("opened capture");
-        let reservations = pipeline.reserve_outputs();
-        // Only skip capture when nobody is subscribed.  A full one-slot
-        // subscriber channel must not throw away a captured frame: this probe
-        // runs microseconds after the previous send, so the slot is still
-        // occupied and every other captured frame would be discarded
-        // (60 fps source -> 30 fps output).
+        // Only skip capture when nobody is subscribed.  Delivery capacity must
+        // not be probed here: this point is microseconds after the previous
+        // send, so the one-slot subscriber channel is still occupied and the
+        // probe fails on every other iteration, which silently costs the
+        // delivery of that frame (60 fps source -> 30 fps delivered).  Capacity
+        // is reserved at the delivery point below instead.
         let result = if pipeline.subscriber_count() == 0 {
             match capture.encoder.as_mut().expect("active encoder") {
                 CaptureEncoder::Dma(_) => capture
@@ -347,9 +355,26 @@ fn run(
                     config.fps,
                 ));
                 fps_frames += frames.len() as u32;
+                if perf_logging {
+                    perf_loops += 1;
+                    perf_encoded += frames.len() as u64;
+                }
+                // Reserve delivery capacity at the moment of delivery.  The
+                // consumer has had a whole frame interval to drain the previous
+                // batch here, so a healthy subscriber always has a free slot;
+                // a genuinely full slot only skips this one delivery, exactly
+                // like the old per-subscriber try_send drop.
+                let reservations = pipeline.reserve_outputs();
+                if perf_logging && reservations.is_none() {
+                    perf_probe_miss += 1;
+                }
+                let reservations = reservations.unwrap_or_default();
+                if perf_logging && !reservations.is_empty() {
+                    perf_delivered += frames.len() as u64;
+                }
                 pipeline.broadcast_encoded_batch(
                     frames.into_iter().map(Arc::new).collect::<Vec<_>>().into(),
-                    reservations.unwrap_or_default(),
+                    reservations,
                 );
             }
             Ok(Err(error)) => {
@@ -410,6 +435,22 @@ fn run(
                 fps_frames as f32 / fps_start.elapsed().as_secs_f32();
             fps_frames = 0;
             fps_start = Instant::now();
+        }
+        if perf_logging && perf_start.elapsed() >= Duration::from_secs(5) {
+            let elapsed = perf_start.elapsed().as_secs_f64();
+            info!(
+                "[DmaPerf] window_s={:.1} loops_fps={:.1} encoded_fps={:.1} delivered_fps={:.1} probe_miss={}",
+                elapsed,
+                perf_loops as f64 / elapsed,
+                perf_encoded as f64 / elapsed,
+                perf_delivered as f64 / elapsed,
+                perf_probe_miss
+            );
+            perf_start = Instant::now();
+            perf_loops = 0;
+            perf_encoded = 0;
+            perf_delivered = 0;
+            perf_probe_miss = 0;
         }
     }
     // Explicitly release in the worker before Completion publishes stopped.
