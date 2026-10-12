@@ -579,7 +579,39 @@ impl UniversalSession {
 
             let mut frames_sent: u64 = 0;
 
+            // Temporary diagnostics (ONE_KVM_VIDEO_STATS=1): what rate is actually
+            // handed to the RTP/WebRTC stack, and what it costs per frame.
+            let perf_logging = std::env::var("ONE_KVM_VIDEO_STATS").as_deref() == Ok("1");
+            let mut perf_start = Instant::now();
+            let mut perf_sent = 0u64;
+            let mut perf_bytes = 0u64;
+            let mut perf_send_ns = 0u64;
+            let mut perf_send_errors = 0u64;
+            let mut perf_skipped = 0u64;
+
             loop {
+                if perf_logging && perf_start.elapsed() >= Duration::from_secs(5) {
+                    let elapsed = perf_start.elapsed().as_secs_f64();
+                    info!(
+                        "[SendPerf] window_s={:.1} sent_fps={:.1} avg_send_ms={:.2} mbps={:.2} send_errors={} receiver_skipped={}",
+                        elapsed,
+                        perf_sent as f64 / elapsed,
+                        if perf_sent > 0 {
+                            perf_send_ns as f64 / perf_sent as f64 / 1_000_000.0
+                        } else {
+                            0.0
+                        },
+                        perf_bytes as f64 * 8.0 / elapsed / 1_000_000.0,
+                        perf_send_errors,
+                        perf_skipped
+                    );
+                    perf_start = Instant::now();
+                    perf_sent = 0;
+                    perf_bytes = 0;
+                    perf_send_ns = 0;
+                    perf_send_errors = 0;
+                    perf_skipped = 0;
+                }
                 tokio::select! {
                     biased;
 
@@ -664,11 +696,15 @@ impl UniversalSession {
                                     }
                                 }
                                 if !forward_parameter_frame {
+                                    if perf_logging {
+                                        perf_skipped += 1;
+                                    }
                                     continue;
                                 }
                             }
                         }
 
+                        let send_started = Instant::now();
                         let send_result = video_track
                             .write_frame_bytes_at(
                                 encoded_frame.data.clone(),
@@ -677,6 +713,14 @@ impl UniversalSession {
                             )
                             .await;
                         frame_rx.record_send(send_result.is_ok());
+                        if perf_logging {
+                            perf_sent += 1;
+                            perf_bytes += encoded_frame.data.len() as u64;
+                            perf_send_ns += send_started.elapsed().as_nanos() as u64;
+                            if send_result.is_err() {
+                                perf_send_errors += 1;
+                            }
+                        }
                         match send_result {
                             Ok(()) => {
                                 frames_sent += 1;

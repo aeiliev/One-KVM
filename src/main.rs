@@ -100,7 +100,11 @@ async fn main() -> anyhow::Result<()> {
 
     init_logging(args.log_level);
 
-    tracing::info!("Starting One-KVM v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!(
+        "Starting One-KVM v{} (build {})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("ONE_KVM_BUILD_ID").unwrap_or("unknown")
+    );
     let platform = PlatformCapabilities::current();
     tracing::info!(
         "Platform mode: {:?} ({})",

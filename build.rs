@@ -8,10 +8,62 @@ fn main() {
     // Generate minimal secrets module
     generate_secrets();
 
+    // Embed a build identity so a running binary can be traced back to the
+    // revision it was compiled from (a container tag is not proof).
+    generate_build_id();
+
     // Rerun if the script itself changes
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=protos/rendezvous.proto");
     println!("cargo:rerun-if-changed=protos/message.proto");
+}
+
+/// Expose `ONE_KVM_BUILD_ID` to the crate, readable as `env!("ONE_KVM_BUILD_ID")`.
+///
+/// Preference order: an explicit `ONE_KVM_BUILD_ID`, then the CI-provided
+/// `GITHUB_REF_NAME`/`GITHUB_SHA`, then `git rev-parse`, then "unknown".
+fn generate_build_id() {
+    fn non_empty(value: Option<String>) -> Option<String> {
+        value.filter(|value| !value.trim().is_empty())
+    }
+
+    let git_sha = || {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "--short=12", "HEAD"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        non_empty(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
+    };
+
+    let explicit = non_empty(std::env::var("ONE_KVM_BUILD_ID").ok());
+    let ci_ref = non_empty(std::env::var("GITHUB_REF_NAME").ok());
+    let ci_sha = non_empty(std::env::var("GITHUB_SHA").ok()).map(|sha| {
+        if sha.len() > 12 {
+            sha[..12].to_string()
+        } else {
+            sha
+        }
+    });
+    let sha = explicit
+        .clone()
+        .or(ci_sha)
+        .or_else(git_sha)
+        .unwrap_or_else(|| "unknown".to_string());
+    let build_id = match (explicit, ci_ref) {
+        (Some(explicit), _) => explicit,
+        (None, Some(reference)) => format!("{reference}@{sha}"),
+        (None, None) => sha,
+    };
+
+    println!("cargo:rustc-env=ONE_KVM_BUILD_ID={build_id}");
+    println!("cargo:rerun-if-env-changed=ONE_KVM_BUILD_ID");
+    println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
+    println!("cargo:rerun-if-env-changed=GITHUB_SHA");
 }
 
 /// Compile protobuf files using protobuf-codegen (same as RustDesk server)

@@ -107,11 +107,15 @@ pub(super) fn start(
     let _ = pipeline.running.send(true);
     let worker = pipeline.clone();
     info!(
-        "RKMPP DMA candidate: device={} format={:?} resolution={:?} stride={}",
+        "RKMPP DMA candidate: device={} format={:?} resolution={:?} stride={} fps={} source_fps={:?} gop={} bitrate_kbps={}",
         device.display(),
         stream.format(),
         stream.resolution(),
-        stream.stride()
+        stream.stride(),
+        config.fps,
+        stream.source_fps(),
+        config.gop_size(),
+        config.bitrate_kbps()
     );
     let active = ActiveCapture {
         encoder: Some(CaptureEncoder::Dma(encoder)),
@@ -131,7 +135,7 @@ pub(super) fn start(
             "Failed to start RKMPP DMA worker: {error}"
         )));
     }
-    info!("RKMPP DMA capture path active: no CPU raw-frame copies (ONE_KVM_RKMPP_DMABUF=0 disables it)");
+    info!("RKMPP DMA capture path active: no CPU raw-frame copies, delivery capacity probed at send time (ONE_KVM_RKMPP_DMABUF=0 disables it)");
     Ok(())
 }
 
@@ -154,14 +158,23 @@ fn run(
     let mut fps_frames = 0u32;
     let mut fps_start = Instant::now();
     let errors = LogThrottler::with_secs(5);
-    // Opt-in diagnostics: ONE_KVM_VIDEO_STATS=1.  delivered_fps is the number
-    // that matters to a client; encoded_fps is what the encoder produced.
+    // Temporary diagnostics: one line every 5 s when ONE_KVM_VIDEO_STATS=1.
+    // capture_fps comes from the V4L2 buffer sequence, i.e. how many frames the
+    // driver actually produced, which separates "the camera only delivers
+    // 30 fps" from "the pipeline drops frames the camera did deliver".
     let perf_logging = std::env::var("ONE_KVM_VIDEO_STATS").as_deref() == Ok("1");
+    let mut frame_sequence: u64 = 0;
     let mut perf_start = Instant::now();
     let mut perf_loops = 0u64;
     let mut perf_encoded = 0u64;
     let mut perf_delivered = 0u64;
     let mut perf_probe_miss = 0u64;
+    let mut perf_first_sequence: Option<u64> = None;
+    let mut perf_last_sequence: u64 = 0;
+    let mut perf_dequeue_ns = 0u64;
+    let mut perf_encode_ns = 0u64;
+    let mut perf_keyframes = 0u64;
+    let mut perf_bytes = 0u64;
 
     while pipeline.running_flag.load(Ordering::Acquire) {
         if pipeline.subscriber_count() == 0 {
@@ -287,16 +300,25 @@ fn run(
             match capture.encoder.as_mut().expect("active encoder") {
                 CaptureEncoder::Dma(encoder) => {
                     let pts = pipeline.pts_ms();
+                    let dequeue_started = Instant::now();
                     capture
                         .stream
                         .with_next_dmabuf(|index, bytes_used, fresh_fd| {
+                            let dequeue_wait = dequeue_started.elapsed();
                             let keyframe =
                                 pipeline.keyframe_requested.swap(false, Ordering::AcqRel);
+                            let encode_started = Instant::now();
                             // The callback holds the dequeue lease until native encode
                             // completes (or destroys MPP on error), before QBUF.
-                            unsafe { encoder.encode(index, bytes_used, fresh_fd, pts, keyframe) }
+                            let encoded = unsafe {
+                                encoder.encode(index, bytes_used, fresh_fd, pts, keyframe)
+                            };
+                            (encoded, dequeue_wait, encode_started.elapsed())
                         })
-                        .map(|(_, packet)| {
+                        .map(|(meta, (packet, dequeue_wait, encode_time))| {
+                            frame_sequence = meta.sequence;
+                            perf_dequeue_ns += dequeue_wait.as_nanos() as u64;
+                            perf_encode_ns += encode_time.as_nanos() as u64;
                             packet
                                 .map(|packet| {
                                     let data = Bytes::from(packet);
@@ -315,6 +337,10 @@ fn run(
                                             data,
                                             is_keyframe,
                                         );
+                                    perf_bytes += data.len() as u64;
+                                    if is_keyframe {
+                                        perf_keyframes += 1;
+                                    }
                                     vec![EncodedVideoFrame {
                                         data,
                                         pts_ms: pts,
@@ -333,6 +359,7 @@ fn run(
                 CaptureEncoder::Copy(encoder) => {
                     let mut raw = buffer_pool.take(0);
                     capture.stream.next_into(&mut raw).map(|meta| {
+                        frame_sequence = meta.sequence;
                         let frame = VideoFrame::from_pooled(
                             Arc::new(FrameBuffer::new(raw, Some(buffer_pool.clone()))),
                             config.resolution,
@@ -355,21 +382,23 @@ fn run(
                     config.fps,
                 ));
                 fps_frames += frames.len() as u32;
-                if perf_logging {
-                    perf_loops += 1;
-                    perf_encoded += frames.len() as u64;
+                perf_loops += 1;
+                perf_encoded += frames.len() as u64;
+                if perf_first_sequence.is_none() {
+                    perf_first_sequence = Some(frame_sequence);
                 }
+                perf_last_sequence = frame_sequence;
                 // Reserve delivery capacity at the moment of delivery.  The
                 // consumer has had a whole frame interval to drain the previous
                 // batch here, so a healthy subscriber always has a free slot;
                 // a genuinely full slot only skips this one delivery, exactly
                 // like the old per-subscriber try_send drop.
                 let reservations = pipeline.reserve_outputs();
-                if perf_logging && reservations.is_none() {
+                if reservations.is_none() {
                     perf_probe_miss += 1;
                 }
                 let reservations = reservations.unwrap_or_default();
-                if perf_logging && !reservations.is_empty() {
+                if !reservations.is_empty() {
                     perf_delivered += frames.len() as u64;
                 }
                 pipeline.broadcast_encoded_batch(
@@ -438,19 +467,42 @@ fn run(
         }
         if perf_logging && perf_start.elapsed() >= Duration::from_secs(5) {
             let elapsed = perf_start.elapsed().as_secs_f64();
+            let capture_fps = match perf_first_sequence {
+                Some(first) if perf_last_sequence > first => {
+                    (perf_last_sequence - first) as f64 / elapsed
+                }
+                _ => 0.0,
+            };
+            let per_loop_ms = |ns: u64| {
+                if perf_loops > 0 {
+                    ns as f64 / perf_loops as f64 / 1_000_000.0
+                } else {
+                    0.0
+                }
+            };
             info!(
-                "[DmaPerf] window_s={:.1} loops_fps={:.1} encoded_fps={:.1} delivered_fps={:.1} probe_miss={}",
+                "[DmaPerf] window_s={:.1} capture_fps={:.1} loops_fps={:.1} encoded_fps={:.1} delivered_fps={:.1} probe_miss={} dequeue_ms={:.2} encode_ms={:.2} keyframes={} mbps={:.2}",
                 elapsed,
+                capture_fps,
                 perf_loops as f64 / elapsed,
                 perf_encoded as f64 / elapsed,
                 perf_delivered as f64 / elapsed,
-                perf_probe_miss
+                perf_probe_miss,
+                per_loop_ms(perf_dequeue_ns),
+                per_loop_ms(perf_encode_ns),
+                perf_keyframes,
+                perf_bytes as f64 * 8.0 / elapsed / 1_000_000.0
             );
             perf_start = Instant::now();
             perf_loops = 0;
             perf_encoded = 0;
             perf_delivered = 0;
             perf_probe_miss = 0;
+            perf_first_sequence = None;
+            perf_dequeue_ns = 0;
+            perf_encode_ns = 0;
+            perf_keyframes = 0;
+            perf_bytes = 0;
         }
     }
     // Explicitly release in the worker before Completion publishes stopped.
