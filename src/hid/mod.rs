@@ -8,6 +8,7 @@ mod ch9329_proto;
 pub mod consumer;
 pub mod datachannel;
 mod factory;
+pub mod jiggler;
 pub mod keyboard;
 mod macos_drag;
 #[cfg(unix)]
@@ -19,6 +20,7 @@ pub mod websocket;
 
 pub use crate::events::LedState;
 pub use backend::{HidBackend, HidBackendRuntimeSnapshot, HidBackendType};
+pub use jiggler::{InputActivity, MouseJiggler};
 pub use keyboard::CanonicalKey;
 pub use types::{
     ConsumerEvent, KeyEventType, KeyboardEvent, KeyboardModifiers, MouseButton, MouseEvent,
@@ -137,6 +139,8 @@ pub struct HidController {
     backend_available: Arc<AtomicBool>,
     reset_requested: Arc<AtomicBool>,
     screen_resolution: parking_lot::RwLock<(u32, u32)>,
+    activity: Arc<InputActivity>,
+    last_abs_pos: Arc<parking_lot::Mutex<(i32, i32)>>,
 }
 
 impl HidController {
@@ -160,6 +164,8 @@ impl HidController {
             backend_available: Arc::new(AtomicBool::new(false)),
             reset_requested: Arc::new(AtomicBool::new(false)),
             screen_resolution: parking_lot::RwLock::new((1920, 1080)),
+            activity: Arc::new(InputActivity::new()),
+            last_abs_pos: Arc::new(parking_lot::Mutex::new((16384, 16384))),
         }
     }
 
@@ -183,6 +189,8 @@ impl HidController {
             backend_available: Arc::new(AtomicBool::new(false)),
             reset_requested: Arc::new(AtomicBool::new(false)),
             screen_resolution: parking_lot::RwLock::new((1920, 1080)),
+            activity: Arc::new(InputActivity::new()),
+            last_abs_pos: Arc::new(parking_lot::Mutex::new((16384, 16384))),
         }
     }
 
@@ -278,21 +286,39 @@ impl HidController {
         Ok(())
     }
 
+    /// User keyboard input. Recording activity here and in the other `send_*`
+    /// methods covers every transport (WebSocket, WebRTC, VNC, RustDesk and
+    /// Computer Use) with a single hook.
     pub async fn send_keyboard(&self, event: KeyboardEvent) -> Result<()> {
         if !self.backend_available.load(Ordering::Acquire) {
             return Err(AppError::BadRequest(
                 "HID backend not available".to_string(),
             ));
         }
+        self.activity.touch();
         self.enqueue_event(QueuedHidEvent::Keyboard(event)).await
     }
 
     pub async fn send_mouse(&self, event: MouseEvent) -> Result<()> {
+        // Track the position *before* recording activity: a jiggler woken by
+        // this input must already observe the new position, otherwise it could
+        // decide to send a return move back to a stale origin.
+        self.track_absolute_position(&event);
+        self.activity.touch();
+        self.send_mouse_unattributed(event).await
+    }
+
+    /// Send a mouse event that must not count as user activity. Only the mouse
+    /// jiggler uses this, so its own movement cannot keep resetting the idle
+    /// timer it depends on.
+    pub(crate) async fn send_mouse_unattributed(&self, event: MouseEvent) -> Result<()> {
         if !self.backend_available.load(Ordering::Acquire) {
             return Err(AppError::BadRequest(
                 "HID backend not available".to_string(),
             ));
         }
+
+        self.track_absolute_position(&event);
 
         if matches!(
             event.event_type,
@@ -304,12 +330,23 @@ impl HidController {
         }
     }
 
+    /// Remember where absolute moves leave the cursor. Tracked at enqueue time:
+    /// the queue is FIFO for absolute moves, so this is the position the host
+    /// ends up at, which lets the jiggler tell whether anything else moved
+    /// during its hold.
+    fn track_absolute_position(&self, event: &MouseEvent) {
+        if event.event_type == MouseEventType::MoveAbs {
+            *self.last_abs_pos.lock() = (event.x.clamp(0, 32767), event.y.clamp(0, 32767));
+        }
+    }
+
     pub async fn send_consumer(&self, event: ConsumerEvent) -> Result<()> {
         if !self.backend_available.load(Ordering::Acquire) {
             return Err(AppError::BadRequest(
                 "HID backend not available".to_string(),
             ));
         }
+        self.activity.touch();
         self.enqueue_event(QueuedHidEvent::Consumer(event)).await
     }
 
@@ -363,6 +400,22 @@ impl HidController {
             let (width, height) = *self.screen_resolution.read();
             backend.set_screen_resolution(width, height);
         }
+    }
+
+    /// Shared clock of real user input, handed to the mouse jiggler.
+    pub fn activity(&self) -> Arc<InputActivity> {
+        self.activity.clone()
+    }
+
+    /// Current capture resolution, used to scale the jiggler's absolute offset.
+    pub fn screen_resolution(&self) -> (u32, u32) {
+        *self.screen_resolution.read()
+    }
+
+    /// Last absolute mouse position in 0..=32767, or the center if the cursor
+    /// has never been positioned.
+    pub fn last_absolute_position(&self) -> (i32, i32) {
+        *self.last_abs_pos.lock()
     }
 
     pub async fn snapshot(&self) -> HidRuntimeState {

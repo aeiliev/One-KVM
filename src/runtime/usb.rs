@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use crate::config::{AppConfig, HidBackend, HidConfig, MsdConfig, OtgNetworkConfig, UacConfig};
 use crate::error::{AppError, Result};
 use crate::events::EventBus;
-use crate::hid::{HidBackendType, HidController};
+use crate::hid::{HidBackendType, HidController, MouseJiggler};
 #[cfg(unix)]
 use crate::msd::MsdController;
 #[cfg(unix)]
@@ -17,6 +17,7 @@ use super::ConfigApplyOptions;
 
 pub struct UsbCoordinator {
     hid: Arc<HidController>,
+    jiggler: Arc<MouseJiggler>,
     #[cfg(unix)]
     otg: Arc<OtgService>,
     #[cfg(unix)]
@@ -31,6 +32,7 @@ impl UsbCoordinator {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         hid: Arc<HidController>,
+        jiggler: Arc<MouseJiggler>,
         #[cfg(unix)] otg: Arc<OtgService>,
         #[cfg(unix)] msd: Arc<RwLock<Option<MsdController>>>,
         #[cfg(unix)] uac_playback: Arc<RwLock<Option<crate::audio::uac::UacPlayback>>>,
@@ -39,6 +41,7 @@ impl UsbCoordinator {
     ) -> Arc<Self> {
         Arc::new(Self {
             hid,
+            jiggler,
             #[cfg(unix)]
             otg,
             #[cfg(unix)]
@@ -51,6 +54,13 @@ impl UsbCoordinator {
     }
 
     pub async fn apply_config(&self, old_config: &AppConfig, new_config: &AppConfig) -> Result<()> {
+        // The jiggler is not part of the USB gadget, so it is applied up front:
+        // the HID paths below skip reloads when the backend is unchanged, and a
+        // jiggler-only change must still take effect.
+        self.jiggler
+            .apply_config(&new_config.hid.jiggler, new_config.hid.mouse_absolute)
+            .await;
+
         #[cfg(unix)]
         {
             let transitioning_away_from_otg = old_config.hid.backend == HidBackend::Otg

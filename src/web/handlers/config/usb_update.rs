@@ -292,6 +292,7 @@ mod tests {
             otg_functions: None,
             otg_keyboard_leds: None,
             mouse_absolute: None,
+            jiggler: None,
         }
     }
 
@@ -360,5 +361,24 @@ mod tests {
         assert_eq!(hid.ch9329_descriptor, old_descriptor);
         assert_eq!(requested_descriptor.vendor_id, 0x1234);
         assert_eq!(requested_descriptor.product_id, 0x5678);
+    }
+
+    #[test]
+    fn stages_jiggler_config_and_rejects_out_of_range_intervals() {
+        let mut hid = HidConfig::default();
+        let update: HidConfigUpdate = serde_json::from_value(serde_json::json!({
+            "jiggler": { "enabled": true, "interval_secs": 120 }
+        }))
+        .unwrap();
+        stage_hid_config_update(&mut hid, &update).unwrap();
+        assert!(hid.jiggler.enabled);
+        assert_eq!(hid.jiggler.interval_secs, 120);
+
+        let invalid: HidConfigUpdate = serde_json::from_value(serde_json::json!({
+            "jiggler": { "enabled": true, "interval_secs": 0 }
+        }))
+        .unwrap();
+        assert!(stage_hid_config_update(&mut hid, &invalid).is_err());
+        assert_eq!(hid.jiggler.interval_secs, 120);
     }
 }

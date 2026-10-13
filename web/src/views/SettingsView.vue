@@ -691,6 +691,8 @@ const config = ref({
     consumer: true,
   } as OtgHidFunctions,
   hid_otg_keyboard_leds: false,
+  hid_jiggler_enabled: false,
+  hid_jiggler_interval: 60,
   msd_enabled: false,
   msd_dir: '',
   msd_flash_inquiry_string: 'One-KVM Virtual Flash',
@@ -1178,11 +1180,21 @@ const hasMacosDragInterfaceConflict = computed(() =>
   && (!effectiveOtgFunctions.value.mouse_relative || !effectiveOtgFunctions.value.mouse_absolute)
 )
 
+const JIGGLER_MIN_INTERVAL_SECS = 5
+const JIGGLER_MAX_INTERVAL_SECS = 3600
+const isJigglerIntervalValid = computed(() => {
+  const seconds = Number(config.value.hid_jiggler_interval)
+  return Number.isFinite(seconds)
+    && seconds >= JIGGLER_MIN_INTERVAL_SECS
+    && seconds <= JIGGLER_MAX_INTERVAL_SECS
+})
+
 const isHidSettingsValid = computed(() =>
   isHidFunctionSelectionValid.value
   && !hasMacosDragInterfaceConflict.value
   && isCh9329DescriptorValid.value
   && areMsdInquiryStringsValid.value
+  && isJigglerIntervalValid.value
 )
 
 watch(bindMode, (mode) => {
@@ -1459,6 +1471,11 @@ async function saveConfig() {
         return
       }
       const hidUpdate: HidConfigUpdate = {}
+      // Backend-independent, so it is set before the backend-specific branches.
+      hidUpdate.jiggler = {
+        enabled: config.value.hid_jiggler_enabled,
+        interval_secs: config.value.hid_jiggler_interval,
+      }
       if (config.value.hid_backend === 'ch9329' && isCh9329DescriptorDirty.value) {
         hidUpdate.ch9329_descriptor = {
           vendor_id: parseInt(ch9329VendorIdHex.value, 16) || 0x1a86,
@@ -1528,7 +1545,7 @@ async function saveConfig() {
 const hidFeatureBaseline = ref('')
 function hidFeatureSnapshot() {
   return JSON.stringify({
-    fields: Object.fromEntries(Object.entries(config.value).filter(([key]) => key.startsWith('msd_') || key.startsWith('otg_network_') || key.startsWith('uac_') || ['hid_otg_functions', 'hid_otg_keyboard_leds'].includes(key))),
+    fields: Object.fromEntries(Object.entries(config.value).filter(([key]) => key.startsWith('msd_') || key.startsWith('otg_network_') || key.startsWith('uac_') || ['hid_otg_functions', 'hid_otg_keyboard_leds', 'hid_jiggler_enabled', 'hid_jiggler_interval'].includes(key))),
     descriptor: [otgVendorIdHex.value, otgProductIdHex.value, otgManufacturer.value, otgProduct.value, otgSerialNumber.value],
   })
 }
@@ -1569,6 +1586,8 @@ async function loadConfig() {
         consumer: hid.otg_functions?.consumer ?? true,
       } as OtgHidFunctions,
       hid_otg_keyboard_leds: hid.otg_keyboard_leds ?? false,
+      hid_jiggler_enabled: hid.jiggler?.enabled ?? false,
+      hid_jiggler_interval: hid.jiggler?.interval_secs ?? 60,
       msd_enabled: msd.enabled || false,
       msd_dir: msd.msd_dir || '',
       msd_flash_inquiry_string: msd.flash_inquiry_string || 'One-KVM Virtual Flash',
@@ -3429,6 +3448,37 @@ watch(isWindows, () => {
                   </div>
                 </template>
 
+              </CardContent>
+            </Card>
+
+            <!-- Mouse Jiggler -->
+            <Card v-if="configStore.hid?.backend && configStore.hid.backend !== 'none'">
+              <CardHeader>
+                <CardTitle>{{ t('settings.jiggler') }}</CardTitle>
+              </CardHeader>
+              <CardContent class="space-y-4">
+                <div class="flex items-center justify-between gap-4">
+                  <div class="space-y-1">
+                    <Label for="hid-jiggler-enabled">{{ t('settings.jigglerEnabled') }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t('settings.jigglerDesc') }}</p>
+                  </div>
+                  <Switch id="hid-jiggler-enabled" v-model="config.hid_jiggler_enabled" />
+                </div>
+                <Separator />
+                <div class="space-y-2">
+                  <Label for="hid-jiggler-interval">{{ t('settings.jigglerInterval') }}</Label>
+                  <Input
+                    id="hid-jiggler-interval"
+                    type="number"
+                    :min="JIGGLER_MIN_INTERVAL_SECS"
+                    :max="JIGGLER_MAX_INTERVAL_SECS"
+                    :disabled="!config.hid_jiggler_enabled"
+                    v-model.number="config.hid_jiggler_interval"
+                  />
+                  <p class="text-xs" :class="isJigglerIntervalValid ? 'text-muted-foreground' : 'text-warning'">
+                    {{ t('settings.jigglerIntervalHint', { min: JIGGLER_MIN_INTERVAL_SECS, max: JIGGLER_MAX_INTERVAL_SECS }) }}
+                  </p>
+                </div>
               </CardContent>
             </Card>
 

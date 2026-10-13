@@ -15,6 +15,7 @@ use crate::events::{
 };
 use crate::extensions::{ExtensionId, ExtensionManager};
 use crate::hid::HidController;
+use crate::hid::MouseJiggler;
 #[cfg(unix)]
 use crate::msd::MsdController;
 #[cfg(unix)]
@@ -72,6 +73,7 @@ pub struct AppState {
     pub stream_manager: Arc<VideoStreamManager>,
     pub webrtc: Arc<WebRtcStreamer>,
     pub hid: Arc<HidController>,
+    pub jiggler: Arc<MouseJiggler>,
     pub computer_use: Arc<ComputerUseManager>,
     #[cfg(unix)]
     pub msd: Arc<RwLock<Option<MsdController>>>,
@@ -126,8 +128,10 @@ impl AppState {
         let msd = Arc::new(RwLock::new(msd));
         #[cfg(unix)]
         let uac_playback = Arc::new(RwLock::new(None));
+        let jiggler = Arc::new(MouseJiggler::new(hid.clone(), hid.activity()));
         let usb = UsbCoordinator::new(
             hid.clone(),
+            jiggler.clone(),
             #[cfg(unix)]
             otg_service.clone(),
             #[cfg(unix)]
@@ -149,6 +153,7 @@ impl AppState {
             stream_manager,
             webrtc,
             hid,
+            jiggler,
             computer_use,
             #[cfg(unix)]
             msd,

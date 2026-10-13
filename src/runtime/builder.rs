@@ -178,6 +178,7 @@ impl RuntimeBuilder {
 
         start_uac_playback(&state, &config).await;
         start_watchdog(&state, &config).await;
+        start_jiggler(&state, &config).await;
         extensions.set_event_bus(events.clone()).await;
         state.remote_access.start_configured(&config).await;
 
@@ -545,6 +546,13 @@ async fn start_watchdog(state: &Arc<AppState>, config: &AppConfig) {
     } else {
         tracing::info!("Hardware watchdog started");
     }
+}
+
+async fn start_jiggler(state: &Arc<AppState>, config: &AppConfig) {
+    state
+        .jiggler
+        .apply_config(&config.hid.jiggler, config.hid.mouse_absolute)
+        .await;
 }
 
 #[cfg(test)]

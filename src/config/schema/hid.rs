@@ -211,6 +211,45 @@ impl OtgHidProfile {
     }
 }
 
+/// Device-side mouse jiggler.
+///
+/// `interval_secs` is both the inactivity threshold and the cycle period: once
+/// no keyboard or mouse input has been seen for that long, the jiggler nudges
+/// the cursor and repeats. Matching PiKVM, the interval is randomized by ±25%
+/// on each cycle.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MouseJigglerConfig {
+    pub enabled: bool,
+    pub interval_secs: u32,
+}
+
+impl Default for MouseJigglerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 60,
+        }
+    }
+}
+
+impl MouseJigglerConfig {
+    pub const MIN_INTERVAL_SECS: u32 = 5;
+    pub const MAX_INTERVAL_SECS: u32 = 3600;
+
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if !(Self::MIN_INTERVAL_SECS..=Self::MAX_INTERVAL_SECS).contains(&self.interval_secs) {
+            return Err(crate::error::AppError::BadRequest(format!(
+                "Mouse jiggler interval must be between {} and {} seconds",
+                Self::MIN_INTERVAL_SECS,
+                Self::MAX_INTERVAL_SECS
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -236,6 +275,8 @@ pub struct HidConfig {
     #[serde(default)]
     pub ch9329_descriptor: Ch9329DescriptorConfig,
     pub mouse_absolute: bool,
+    #[serde(default)]
+    pub jiggler: MouseJigglerConfig,
 }
 
 impl Default for HidConfig {
@@ -254,6 +295,7 @@ impl Default for HidConfig {
             mouse_macos_drag: false,
             ch9329_descriptor: Ch9329DescriptorConfig::default(),
             mouse_absolute: true,
+            jiggler: MouseJigglerConfig::default(),
         }
     }
 }
@@ -371,6 +413,42 @@ mod bluetooth_tests {
         assert!(config.validate().is_err());
         config.peer = None;
         config.name = "蓝".repeat(24);
+        assert!(config.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod jiggler_tests {
+    use super::*;
+
+    #[test]
+    fn jiggler_defaults_to_disabled_with_a_one_minute_interval() {
+        let config = MouseJigglerConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.interval_secs, 60);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn existing_configs_without_a_jiggler_section_get_defaults() {
+        let config: HidConfig = serde_json::from_str(r#"{"backend":"otg"}"#).unwrap();
+        assert_eq!(config.jiggler, MouseJigglerConfig::default());
+        assert!(!config.jiggler.enabled);
+    }
+
+    #[test]
+    fn jiggler_interval_bounds_are_enforced() {
+        let mut config = MouseJigglerConfig {
+            enabled: true,
+            interval_secs: MouseJigglerConfig::MIN_INTERVAL_SECS,
+        };
+        config.validate().unwrap();
+        config.interval_secs = MouseJigglerConfig::MAX_INTERVAL_SECS;
+        config.validate().unwrap();
+
+        config.interval_secs = 0;
+        assert!(config.validate().is_err());
+        config.interval_secs = MouseJigglerConfig::MAX_INTERVAL_SECS + 1;
         assert!(config.validate().is_err());
     }
 }

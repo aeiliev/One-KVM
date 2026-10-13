@@ -60,6 +60,11 @@ export interface Ch9329DescriptorConfig {
 	serial_number?: string;
 }
 
+export interface MouseJigglerConfig {
+	enabled: boolean;
+	interval_secs: number;
+}
+
 export interface HidConfig {
 	bluetooth: BluetoothHidConfig;
 	backend: HidBackend;
@@ -74,6 +79,7 @@ export interface HidConfig {
 	mouse_macos_drag?: boolean;
 	ch9329_descriptor?: Ch9329DescriptorConfig;
 	mouse_absolute: boolean;
+	jiggler?: MouseJigglerConfig;
 }
 
 export enum OtgNetworkDriverMode {
@@ -579,6 +585,7 @@ export interface HidConfigUpdate {
 	otg_functions?: OtgHidFunctionsUpdate;
 	otg_keyboard_leds?: boolean;
 	mouse_absolute?: boolean;
+	jiggler?: MouseJigglerConfig;
 }
 
 export interface MsdConfigUpdate {

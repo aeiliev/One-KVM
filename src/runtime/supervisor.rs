@@ -190,6 +190,10 @@ async fn cleanup(state: &Arc<AppState>) {
         tracing::warn!("Failed to stop streamer: {}", error);
     }
 
+    // Stop the jiggler before the HID backend goes away, so it cannot wake up
+    // mid-shutdown and log a failure against a torn-down backend.
+    state.jiggler.stop().await;
+
     if let Err(error) = state.hid.shutdown().await {
         tracing::warn!("Failed to shutdown HID: {}", error);
     }

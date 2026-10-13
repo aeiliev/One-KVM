@@ -418,6 +418,7 @@ pub struct HidConfigUpdate {
     pub otg_functions: Option<OtgHidFunctionsUpdate>,
     pub otg_keyboard_leds: Option<bool>,
     pub mouse_absolute: Option<bool>,
+    pub jiggler: Option<crate::config::MouseJigglerConfig>,
 }
 
 #[typeshare]
@@ -433,6 +434,9 @@ impl HidConfigUpdate {
     pub fn validate(&self) -> crate::error::Result<()> {
         if let Some(config) = &self.bluetooth {
             config.validate()?;
+        }
+        if let Some(jiggler) = &self.jiggler {
+            jiggler.validate()?;
         }
         if let Some(baudrate) = self.ch9329_baudrate {
             let valid_rates = [9600, 19200, 38400, 57600, 115200];
@@ -490,6 +494,9 @@ impl HidConfigUpdate {
         }
         if let Some(absolute) = self.mouse_absolute {
             config.mouse_absolute = absolute;
+        }
+        if let Some(ref jiggler) = self.jiggler {
+            config.jiggler = jiggler.clone();
         }
     }
 }
